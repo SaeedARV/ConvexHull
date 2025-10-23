@@ -1,0 +1,6 @@
+cvxpy
+matplotlib
+numpy
+scipy
+shapely
+torch
