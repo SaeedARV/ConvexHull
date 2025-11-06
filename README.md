@@ -27,8 +27,8 @@ Gaussian, and annulus shells), run all solvers, and report accuracy/runtime
 metrics against SciPy’s exact hull:
 
 ```bash
-python benchmark_convex_hulls.py --datasets uniform,gaussian,annulus \
-    --samples 200 --min-points 20 --max-points 50
+python3 benchmark_convex_hulls.py --datasets uniform,gaussian,annulus \
+    --samples 200 --min-points 50 --max-points 50
 ```
 
 Key columns in the output table:
