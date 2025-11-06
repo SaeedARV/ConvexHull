@@ -227,9 +227,13 @@ def benchmark(
     seed: int,
     random_extents: int,
     mvee_kwargs: Dict[str, int],
+    deephull_kwargs: Optional[Dict[str, float]] = None,
 ) -> None:
     rng = np.random.default_rng(seed)
-    deephull_model = ConvexHullviaDeepHull() if ConvexHullviaDeepHull is not None else None
+    if ConvexHullviaDeepHull is not None:
+        deephull_model = ConvexHullviaDeepHull(**(deephull_kwargs or {}))
+    else:
+        deephull_model = None
 
     method_fns = {
         "Extents": lambda pts: run_extents(pts, random_samples=random_extents),
@@ -288,6 +292,10 @@ def parse_args() -> argparse.Namespace:
                         help="Number of random directions used by the Extents method.")
     parser.add_argument("--mvee-m", type=int, default=8, help="Number of directions sampled for MVEE.")
     parser.add_argument("--mvee-kappa", type=int, default=45, help="Concentration parameter for MVEE sampling.")
+    parser.add_argument("--deephull-epochs", type=int, default=200, help="Training epochs for DeepHull.")
+    parser.add_argument("--deephull-lambda", type=float, default=2.0, help="Negative sample weight for DeepHull.")
+    parser.add_argument("--deephull-epsilon", type=float, default=0.05,
+                        help="Tolerance used to collect points near the learned decision boundary.")
     return parser.parse_args()
 
 
@@ -305,4 +313,9 @@ if __name__ == "__main__":
         seed=args.seed,
         random_extents=args.random_extents,
         mvee_kwargs={"m": args.mvee_m, "kappa": args.mvee_kappa},
+        deephull_kwargs={
+            "max_epochs": args.deephull_epochs,
+            "lambda_neg": args.deephull_lambda,
+            "level_set_epsilon": args.deephull_epsilon,
+        },
     )

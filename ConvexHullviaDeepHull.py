@@ -1,320 +1,294 @@
-"""
-Standalone inference pipeline for DeepHullNet-based convex hull prediction.
-
-This module copies the minimal pieces of the original DeepHullNet repository
-needed for inference so that the rest of the project no longer depends on the
-`DeepHullNet/` directory.  The interface mirrors the existing MVEE and Extents
-implementations: instantiate the class with a point cloud and call `compute()`
-to obtain the hull vertices predicted by the neural model.
-"""
-from __future__ import annotations
-
-import os
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import numpy as np
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-except ModuleNotFoundError as exc:  # pragma: no cover - surfaces at runtime
-    torch = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
-    F = None  # type: ignore[assignment]
-    _TORCH_IMPORT_ERROR = exc
-else:
-    _TORCH_IMPORT_ERROR = None  # type: ignore[assignment]
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data
 
 
-TOKENS = {"<sos>": 0, "<eos>": 1}
-SPECIAL_TOKEN_COUNT = len(TOKENS)
-DEEPNET_FEATURES = 5  # (x, y, is_sos, is_eos, is_padding)
+torch.manual_seed(41)
+np.random.seed(41)
 
 
-def _ensure_torch():
-    if torch is None or nn is None or F is None:
-        raise ModuleNotFoundError(
-            "ConvexHullviaDeepHull requires PyTorch. "
-            "Install torch before creating a ConvexHullviaDeepHull instance."
-        ) from _TORCH_IMPORT_ERROR
+def _to_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
+    return torch.as_tensor(array, dtype=torch.float32, device=device)
 
 
-class _AdditivePointer(nn.Module):
+class NonNegativeLinear(nn.Module):
     """
-    Lightweight pointer mechanism adapted from DeepHullNet.
-
-    The implementation is reformulated to keep batch-first tensors internally
-    while preserving the original additive attention scoring.
+    Linear layer with non-negative weights enforced via softplus reparameterisation.
     """
 
-    def __init__(self, hidden_dim: int):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
-        # Preserve original parameter names for checkpoint compatibility.
-        self.w1 = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.v = nn.Linear(hidden_dim, 1, bias=False)
+        self.weight_raw = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.reset_parameters()
 
-    def forward(
-        self,
-        decoder_states: torch.Tensor,
-        encoder_states: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            decoder_states: (B, T_dec, H)
-            encoder_states: (B, T_enc, H)
-            mask: (B, T_dec, T_enc) boolean tensor where False entries are disallowed.
-        Returns:
-            Log-probabilities over encoder positions for each decoder step.
-        """
-        # (B, T_dec, T_enc, H)
-        encoded = self.w1(encoder_states).unsqueeze(1)
-        decoded = self.w2(decoder_states).unsqueeze(2)
-        scores = self.v(torch.tanh(encoded + decoded)).squeeze(-1)
-        neg_inf = torch.finfo(scores.dtype).min
-        scores = scores.masked_fill(~mask, neg_inf)
-        return F.log_softmax(scores, dim=-1)
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.weight_raw)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        weight = F.softplus(self.weight_raw)
+        return F.linear(inputs, weight, self.bias)
 
 
-class _DeepHullTransformer(nn.Module):
+class InputConvexNetwork(nn.Module):
     """
-    Transformer encoder/decoder with pointer head for convex hull prediction.
+    Fully-connected input-convex network as described in DeepHull.
     """
 
-    def __init__(
-        self,
-        input_dim: int = DEEPNET_FEATURES,
-        embed_dim: int = 16,
-        hidden_dim: int = 16,
-        num_heads: int = 4,
-        num_layers: int = 3,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, input_dim: int, hidden_sizes: Sequence[int]):
         super().__init__()
-        self.embedding = nn.Linear(input_dim, embed_dim, bias=False)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim,
-            dropout=dropout,
-            batch_first=False,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        if not hidden_sizes:
+            raise ValueError("hidden_sizes must contain at least one layer.")
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim,
-            dropout=dropout,
-            batch_first=False,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
-        self.pointer = _AdditivePointer(hidden_dim=embed_dim)
-        self.num_heads = num_heads
+        self.first = nn.Linear(input_dim, hidden_sizes[0])
+        self.hidden_from_prev = nn.ModuleList()
+        self.hidden_from_input = nn.ModuleList()
+        for idx in range(len(hidden_sizes) - 1):
+            in_size = hidden_sizes[idx]
+            out_size = hidden_sizes[idx + 1]
+            self.hidden_from_prev.append(NonNegativeLinear(in_size, out_size))
+            self.hidden_from_input.append(NonNegativeLinear(input_dim, out_size))
 
-    def forward(
-        self, batch_tokens: torch.Tensor, batch_lengths: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Greedy decoding used at inference time.
+        self.output_layer = NonNegativeLinear(hidden_sizes[-1], 1, bias=True)
+        self.activation = nn.LeakyReLU(negative_slope=0.01)
 
-        Args:
-            batch_tokens: Padded input tokens, shape (B, T, C).
-            batch_lengths: Lengths (including <sos>/<eos>) for each item, shape (B,).
-        Returns:
-            Tuple of (log pointer scores, argmax indices).
-        """
-        return self.greedy_decode(batch_tokens, batch_lengths)
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        z = self.activation(self.first(inputs))
+        for layer_prev, layer_input in zip(self.hidden_from_prev, self.hidden_from_input):
+            z = self.activation(layer_prev(z) + layer_input(inputs))
+        output = self.output_layer(z)
+        return output.squeeze(-1)
 
-    def greedy_decode(
-        self, batch_tokens: torch.Tensor, batch_lengths: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, max_seq_len, _ = batch_tokens.shape
-        device = batch_tokens.device
-        num_steps = max_seq_len - SPECIAL_TOKEN_COUNT
 
-        # Encode sequence (seq_len, batch, embed)
-        embedded = self.embedding(batch_tokens)
-        encoder_seq = self.encoder(embedded.permute(1, 0, 2))
-        encoder_mem = encoder_seq.permute(1, 0, 2)  # (B, T, H)
+class BoundaryGenerator(nn.Module):
+    """
+    Generator that proposes challenging negatives close to the decision boundary.
+    Outputs live in the normalised data space.
+    """
 
-        # Padding mask for encoder memory (True -> pad)
-        positions = torch.arange(max_seq_len, device=device).unsqueeze(0)
-        encoder_pad_mask = positions >= batch_lengths.unsqueeze(1)
+    def __init__(self, noise_dim: int, output_dim: int, hidden_sizes: Sequence[int], radius: float):
+        super().__init__()
+        if not hidden_sizes:
+            raise ValueError("Generator requires hidden layers.")
+        layers: List[nn.Module] = []
+        last = noise_dim
+        for size in hidden_sizes:
+            layers.append(nn.Linear(last, size))
+            layers.append(nn.ReLU())
+            last = size
+        layers.append(nn.Linear(last, output_dim))
+        self.network = nn.Sequential(*layers)
+        self.radius = radius
 
-        # Pointer mask: keeps track of which encoder positions remain selectable.
-        pointer_mask = (
-            positions.unsqueeze(1).expand(batch_size, num_steps, max_seq_len)
-            < batch_lengths.unsqueeze(1).unsqueeze(2)
-        )
-        pointer_mask[:, :, :SPECIAL_TOKEN_COUNT] = False
-
-        decoder_seq = encoder_seq[:1]  # (1, B, H)
-        pointer_scores: List[torch.Tensor] = []
-        pointer_indices: List[torch.Tensor] = []
-
-        for step in range(num_steps):
-            current_mask = pointer_mask[:, : decoder_seq.shape[0], :]
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(
-                decoder_seq.shape[0]
-            ).to(device)
-
-            decoder_out = self.decoder(
-                decoder_seq,
-                encoder_seq,
-                tgt_mask=tgt_mask,
-                memory_key_padding_mask=encoder_pad_mask,
-            )
-
-            decoder_states = decoder_out.permute(1, 0, 2)  # (B, steps, H)
-            pointer_log_scores = self.pointer(
-                decoder_states, encoder_mem, current_mask
-            )
-            step_scores = pointer_log_scores[:, -1, :]
-            step_indices = torch.argmax(step_scores, dim=-1)
-
-            pointer_scores.append(step_scores)
-            pointer_indices.append(step_indices)
-
-            # Prevent selecting the same point twice while keeping special tokens blocked.
-            update_mask = torch.zeros(
-                batch_size, max_seq_len, dtype=torch.bool, device=device
-            )
-            update_mask.scatter_(1, step_indices.unsqueeze(1), True)
-            update_mask[:, :SPECIAL_TOKEN_COUNT] = False
-            pointer_mask[update_mask.unsqueeze(1).expand_as(pointer_mask)] = False
-
-            gathered = encoder_mem.gather(
-                1,
-                step_indices.view(batch_size, 1, 1).expand(
-                    -1, 1, encoder_mem.shape[-1]
-                ),
-            )
-            decoder_seq = torch.cat(
-                (decoder_seq, gathered.permute(1, 0, 2)),
-                dim=0,
-            )
-
-        stacked_scores = torch.stack(pointer_scores, dim=1)
-        stacked_indices = torch.stack(pointer_indices, dim=1)
-        return stacked_scores, stacked_indices
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        raw = self.network(z)
+        return torch.tanh(raw) * self.radius
 
 
 @dataclass
-class DeepHullConfig:
-    max_points: int = 50
-    checkpoint_path: str = "deephull_transform_best_params.pkl"
-    device: Optional[str] = None
+class TrainingStats:
+    epoch: int
+    loss_pos: float
+    loss_neg: float
+    adv_term: float
 
 
 class ConvexHullviaDeepHull:
     """
-    Wrapper exposing DeepHullNet inference through the same interface as the
-    existing convex hull solvers in this project.
+    DeepHull solver that approximates a convex hull through an input-convex network.
     """
 
-    def __init__(self, config: Optional[DeepHullConfig] = None):
-        _ensure_torch()
-        self.config = config or DeepHullConfig()
-        self.max_points = self.config.max_points
-        self.device = self._select_device(self.config.device)
-        self.model = _DeepHullTransformer()
-        self._load_weights(self.config.checkpoint_path)
-        self.model.to(self.device)
-        self.model.eval()
+    def __init__(
+        self,
+        hidden_sizes: Sequence[int] = (64, 64, 64),
+        generator_hidden: Sequence[int] = (64, 64),
+        noise_dim: int = 16,
+        max_epochs: int = 250,
+        batch_size: int = 128,
+        lambda_neg: float = 2.0,
+        generator_steps: int = 1,
+        generator_radius: float = 3.0,
+        level_set_epsilon: float = 0.05,
+        max_grad_norm: Optional[float] = None,
+        device: Optional[str] = None,
+    ):
+        self.hidden_sizes = tuple(hidden_sizes)
+        self.generator_hidden = tuple(generator_hidden)
+        self.noise_dim = int(noise_dim)
+        self.max_epochs = int(max_epochs)
+        self.batch_size = int(batch_size)
+        self.lambda_neg = float(lambda_neg)
+        self.generator_steps = int(generator_steps)
+        self.generator_radius = float(generator_radius)
+        self.level_set_epsilon = float(level_set_epsilon)
+        self.max_grad_norm = max_grad_norm
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+
+        self.model: Optional[InputConvexNetwork] = None
+        self.generator: Optional[BoundaryGenerator] = None
+        self.normaliser_mean: Optional[np.ndarray] = None
+        self.normaliser_std: Optional[np.ndarray] = None
+        self.training_log: List[TrainingStats] = []
+        self._fitted_dim: Optional[int] = None
+
+    def _normalise(self, points: np.ndarray) -> np.ndarray:
+        if self.normaliser_mean is None or self.normaliser_std is None:
+            raise RuntimeError("Normaliser not initialised.")
+        return (points - self.normaliser_mean) / self.normaliser_std
 
     @staticmethod
-    def _select_device(requested: Optional[str]) -> torch.device:
-        if requested is not None:
-            return torch.device(requested)
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
+    def _compute_normaliser(points: np.ndarray) -> Sequence[np.ndarray]:
+        mean = points.mean(axis=0, keepdims=True)
+        std = points.std(axis=0, keepdims=True)
+        std = np.where(std < 1e-6, 1.0, std)
+        return mean, std
 
-    def _load_weights(self, checkpoint_path: str) -> None:
-        if not os.path.isfile(checkpoint_path):
-            raise FileNotFoundError(
-                f"DeepHull checkpoint '{checkpoint_path}' was not found. "
-                "Copy the pretrained weights into the project root (see README)."
-            )
-        payload = torch.load(checkpoint_path, map_location="cpu")
-        if "model_state" not in payload:
-            raise KeyError(
-                f"Expected 'model_state' in checkpoint '{checkpoint_path}'."
-            )
-        self.model.load_state_dict(payload["model_state"])
+    def _initialise_models(self, dim: int) -> None:
+        self.model = InputConvexNetwork(dim, self.hidden_sizes).to(self.device)
+        self.generator = BoundaryGenerator(
+            noise_dim=self.noise_dim,
+            output_dim=dim,
+            hidden_sizes=self.generator_hidden,
+            radius=self.generator_radius,
+        ).to(self.device)
 
-    def compute(self, points: Sequence[Sequence[float]]) -> np.ndarray:
-        """
-        Predict convex hull vertices for a set of 2D points.
-        """
-        hull_indices = self.predict_indices(points)
-        pts = np.asarray(points, dtype=np.float32)
-        if len(hull_indices) == 0:
-            return pts[:0]
-        return pts[hull_indices]
+    def fit(self, points: Sequence[Sequence[float]]) -> None:
+        array = np.asarray(points, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError("Input points must be a 2-D array.")
+        if array.shape[0] < array.shape[1] + 1:
+            raise ValueError("Need at least d+1 points to approximate a convex hull.")
+
+        n_points, dim = array.shape
+        self.normaliser_mean, self.normaliser_std = self._compute_normaliser(array)
+        normalised = self._normalise(array)
+
+        self._initialise_models(dim)
+        assert self.model is not None and self.generator is not None
+        hull_net = self.model
+        generator = self.generator
+
+        dataset = torch.utils.data.TensorDataset(_to_tensor(normalised, self.device))
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=min(self.batch_size, n_points),
+            shuffle=True,
+            drop_last=False,
+        )
+
+        hull_opt = torch.optim.Adam(hull_net.parameters(), lr=1e-3)
+        generator_opt = torch.optim.Adam(generator.parameters(), lr=1e-3)
+
+        hull_net.train()
+        generator.train()
+        self.training_log = []
+
+        for epoch in range(self.max_epochs):
+            pos_losses: List[float] = []
+            neg_losses: List[float] = []
+            adv_terms: List[float] = []
+
+            for (batch_pos,) in loader:
+                batch_pos = batch_pos.to(self.device)
+                batch_size = batch_pos.shape[0]
+
+                # Generator update(s)
+                for _ in range(self.generator_steps):
+                    noise = torch.randn(batch_size, self.noise_dim, device=self.device)
+                    generator_opt.zero_grad(set_to_none=True)
+                    hull_opt.zero_grad(set_to_none=True)
+                    generated = generator(noise)
+                    logits = hull_net(generated)
+                    generator_loss = -torch.mean(torch.sigmoid(logits))
+                    generator_loss.backward()
+                    if self.max_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(generator.parameters(), self.max_grad_norm)
+                    generator_opt.step()
+                    hull_opt.zero_grad(set_to_none=True)
+
+                with torch.no_grad():
+                    noise = torch.randn(batch_size, self.noise_dim, device=self.device)
+                    hard_negatives = generator(noise)
+
+                negatives = hard_negatives
+
+                hull_opt.zero_grad(set_to_none=True)
+                logits_pos = hull_net(batch_pos)
+                logits_neg = hull_net(negatives)
+                labels_pos = torch.zeros_like(logits_pos)
+                labels_neg = torch.ones_like(logits_neg)
+
+                loss_pos = F.binary_cross_entropy_with_logits(logits_pos, labels_pos)
+                loss_neg = F.binary_cross_entropy_with_logits(logits_neg, labels_neg)
+                boundary_term = torch.mean(torch.sigmoid(logits_neg))
+                loss = loss_pos + self.lambda_neg * loss_neg + boundary_term
+
+                loss.backward()
+                if self.max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(hull_net.parameters(), self.max_grad_norm)
+                hull_opt.step()
+
+                pos_losses.append(float(loss_pos.item()))
+                neg_losses.append(float(loss_neg.item()))
+                adv_terms.append(float(boundary_term.item()))
+
+            if not pos_losses:
+                continue
+            self.training_log.append(
+                TrainingStats(
+                    epoch=epoch,
+                    loss_pos=float(np.mean(pos_losses)),
+                    loss_neg=float(np.mean(neg_losses)),
+                    adv_term=float(np.mean(adv_terms)),
+                )
+            )
+
+        hull_net.eval()
+        generator.eval()
+        self._fitted_dim = dim
+
+    def _predict_scores(self, points: np.ndarray) -> np.ndarray:
+        if self.model is None or self.normaliser_mean is None:
+            raise RuntimeError("Model not trained. Call fit() first.")
+        normalised = self._normalise(points)
+        tensor = _to_tensor(normalised, self.device)
+        with torch.no_grad():
+            scores = self.model(tensor).cpu().numpy()
+        return scores.astype(np.float64, copy=False)
 
     def predict_indices(self, points: Sequence[Sequence[float]]) -> List[int]:
-        """
-        Returns hull vertex indices in counter-clockwise order according to the model.
-        """
-        tokens, length = self._format_points(points)
-        input_tensor = tokens.unsqueeze(0).to(self.device)
-        length_tensor = torch.tensor([length], device=self.device)
+        points_array = np.asarray(points, dtype=np.float32)
+        if points_array.ndim != 2:
+            raise ValueError("Input points must be two-dimensional array-like.")
 
-        with torch.no_grad():
-            _, pointer_indices = self.model(input_tensor, length_tensor)
+        dim = points_array.shape[1]
+        self.fit(points_array)
 
-        raw_indices = pointer_indices[0].cpu().tolist()
-        hull_indices: List[int] = []
-        seen = set()
-        num_points = int(length - SPECIAL_TOKEN_COUNT)
+        scores = self._predict_scores(points_array)
+        threshold = -self.level_set_epsilon
+        candidate_indices = [int(i) for i, score in enumerate(scores) if score >= threshold]
+        if len(candidate_indices) < dim + 1:
+            sorted_indices = np.argsort(scores)[::-1]
+            top_k = min(points_array.shape[0], max(dim + 1, len(candidate_indices)))
+            candidate_indices = [int(idx) for idx in sorted_indices[:top_k]]
 
-        for idx in raw_indices:
-            if idx < SPECIAL_TOKEN_COUNT:
-                continue
-            point_idx = idx - SPECIAL_TOKEN_COUNT
-            if point_idx >= num_points:
-                break
-            if point_idx in seen:
-                break
-            seen.add(point_idx)
-            hull_indices.append(point_idx)
-        return hull_indices
-
-    def _format_points(
-        self, points: Sequence[Sequence[float]]
-    ) -> Tuple[torch.Tensor, int]:
-        pts = np.asarray(points, dtype=np.float32)
-        if pts.ndim != 2 or pts.shape[1] != 2:
-            raise ValueError("ConvexHullviaDeepHull expects an (N, 2) array of points.")
-        if pts.shape[0] == 0:
-            raise ValueError("At least one point is required.")
-        if pts.shape[0] > self.max_points:
-            raise ValueError(
-                f"DeepHull checkpoint was trained for at most {self.max_points} points, "
-                f"but received {pts.shape[0]}."
-            )
-
-        tokens = torch.zeros(
-            (self.max_points + SPECIAL_TOKEN_COUNT, DEEPNET_FEATURES),
-            dtype=torch.float32,
-        )
-        tokens[TOKENS["<sos>"], 2] = 1.0
-        tokens[TOKENS["<eos>"], 3] = 1.0
-        tokens[
-            SPECIAL_TOKEN_COUNT : SPECIAL_TOKEN_COUNT + pts.shape[0], :2
-        ] = torch.from_numpy(pts)
-        tokens[
-            SPECIAL_TOKEN_COUNT + pts.shape[0] :, 4
-        ] = 1.0  # padding flag
-        length = pts.shape[0] + SPECIAL_TOKEN_COUNT
-        return tokens, length
+        return candidate_indices
 
 
-__all__ = ["ConvexHullviaDeepHull", "DeepHullConfig"]
+if __name__ == "__main__":
+    from common import sample_input
+
+    data = sample_input()
+    solver = ConvexHullviaDeepHull()
+    indices = solver.predict_indices(data)
+    print("Estimated hull indices:", indices)
