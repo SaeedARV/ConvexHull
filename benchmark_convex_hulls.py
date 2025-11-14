@@ -238,10 +238,8 @@ def benchmark(
         deephull_model = None
 
     method_fns = {}
-    if dimension == 2:
-        method_fns["Extents"] = lambda pts: run_extents(pts, random_samples=random_extents)
-    else:
-        print(f"[INFO] Skipping Extents solver for dimension {dimension}; implemented only for 2D.")
+    
+    method_fns["Extents"] = lambda pts: run_extents(pts, random_samples=random_extents)
     method_fns["MVEE"] = lambda pts: run_mvee(pts, **mvee_kwargs)
     if deephull_model is not None:
         method_fns["DeepHull"] = lambda pts: run_deephull(pts, deephull_model)

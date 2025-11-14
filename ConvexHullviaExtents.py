@@ -17,14 +17,48 @@ class ConvexHullviaExtents:
 
     def get_extents(self, t=1000, return_max_extent=False):
         """
-        Calculates the directions of the convex hull's extents in 2D.
+        Calculates the directions of the convex hull's extents in any dimension.
+
+        For 2D, uses uniform angle sampling. For higher dimensions,
+        uses uniform sampling on the unit sphere.
+
+        Parameters:
+        -----------
+        t : int, optional
+            Number of directions to sample. Default is 1000.
+        return_max_extent : bool, optional
+            If True, also returns the maximum extent direction for each point.
+            Default is False.
+
+        Returns:
+        --------
+        extents : dict
+            Dictionary mapping each point to a list of directions where
+            it is the supporting point.
+        extents_max : dict, optional
+            Dictionary mapping each point to its maximum extent direction.
+            Only returned if return_max_extent is True.
         """
-        directions = np.array(
-            [
-                np.array([np.cos(theta), np.sin(theta)])
-                for theta in np.linspace(0, 2 * np.pi, t)
-            ]
-        )
+        n, d = self.X.shape
+
+        # For 2D, use uniform angle sampling for better coverage
+        # For higher dimensions, use uniform sampling on the unit sphere
+        if d == 2:
+            directions = np.array(
+                [
+                    np.array([np.cos(theta), np.sin(theta)])
+                    for theta in np.linspace(0, 2 * np.pi, t)
+                ]
+            )
+        else:
+            # Sample uniformly on the unit sphere in d dimensions
+            # by sampling from standard normal and normalizing
+            directions = np.random.normal(size=(t, d))
+            norms = np.linalg.norm(directions, axis=1)
+            # Avoid division by zero
+            norms[norms == 0] = 1.0
+            directions = directions / norms[:, np.newaxis]
+
         extents = dict([[tuple(x), []] for x in self.X])
 
         dot_products = np.dot(self.X, directions.T)
@@ -43,17 +77,39 @@ class ConvexHullviaExtents:
 
     def get_random_extents(self, t, return_approx_hull=False):
         """
-        Calculates the randomized directional extent of the convex hull's extents in 2D.
+        Calculates the randomized directional extent of the convex hull's extents
+        in any dimension.
+
+        Parameters:
+        -----------
+        t : int
+            Number of random directions to sample.
+        return_approx_hull : bool, optional
+            If True, also returns the set of points that have at least one extent.
+            Default is False.
+
+        Returns:
+        --------
+        random_extents : dict
+            Dictionary mapping each point to a list of random directions where
+            it is the supporting point.
+        random_extents_set : set, optional
+            Set of points that have at least one extent direction.
+            Only returned if return_approx_hull is True.
         """
-        random_directions = np.random.normal(size=(t, 2))
-        random_directions /= np.linalg.norm(random_directions, axis=1)[:, np.newaxis]
+        n, d = self.X.shape
+        random_directions = np.random.normal(size=(t, d))
+        norms = np.linalg.norm(random_directions, axis=1)
+        # Avoid division by zero
+        norms[norms == 0] = 1.0
+        random_directions = random_directions / norms[:, np.newaxis]
         random_extents = dict({})
         for x in self.X:
             random_extents[tuple(x)] = []
         random_dot_products = np.dot(self.X, random_directions.T)
-        for i, random_directions in enumerate(random_directions):
+        for i, random_direction in enumerate(random_directions):
             x = self.X[np.argmax(random_dot_products[:, i])]
-            random_extents[tuple(x)].append(random_directions)
+            random_extents[tuple(x)].append(random_direction)
 
         if return_approx_hull:
             random_extents_set = set()
