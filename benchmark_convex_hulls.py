@@ -160,27 +160,27 @@ def run_deephull(points: np.ndarray, model: Optional[ConvexHullviaDeepHull]) -> 
     return model.predict_indices(points)
 
 
-def generate_uniform(rng: np.random.Generator, n: int) -> np.ndarray:
-    return rng.random((n, 2))
+def generate_uniform(rng: np.random.Generator, n: int, dim: int) -> np.ndarray:
+    return rng.random((n, dim))
 
 
-def generate_gaussian(rng: np.random.Generator, n: int) -> np.ndarray:
-    pts = rng.normal(loc=0.0, scale=0.6, size=(n, 2))
-    theta = math.pi / 5
-    rot = np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]])
-    anis = np.array([[1.8, 0.0], [0.0, 0.7]])
-    return pts @ anis @ rot.T
+def generate_gaussian(rng: np.random.Generator, n: int, dim: int) -> np.ndarray:
+    pts = rng.normal(loc=0.0, scale=0.6, size=(n, dim))
+    scales = np.linspace(0.5, 1.8, dim)
+    cov = np.diag(scales)
+    return pts @ cov
 
 
-def generate_annulus(rng: np.random.Generator, n: int) -> np.ndarray:
-    angles = rng.uniform(0.0, 2 * math.pi, size=n)
-    radii = rng.uniform(0.4, 1.0, size=n)
-    pts = np.stack([radii * np.cos(angles), radii * np.sin(angles)], axis=1)
-    noise = rng.normal(scale=0.05, size=(n, 2))
-    return pts + noise
+def generate_annulus(rng: np.random.Generator, n: int, dim: int) -> np.ndarray:
+    raw = rng.normal(size=(n, dim))
+    raw /= np.linalg.norm(raw, axis=1, keepdims=True) + 1e-8
+    radii = rng.uniform(0.4, 1.0, size=(n, 1))
+    shell = raw * radii
+    noise = rng.normal(scale=0.05, size=(n, dim))
+    return shell + noise
 
 
-DATASET_GENERATORS: Dict[str, Callable[[np.random.Generator, int], np.ndarray]] = {
+DATASET_GENERATORS: Dict[str, Callable[[np.random.Generator, int, int], np.ndarray]] = {
     "uniform": generate_uniform,
     "gaussian": generate_gaussian,
     "annulus": generate_annulus,
@@ -193,11 +193,12 @@ def iterate_point_sets(
     n_samples: int,
     min_points: int,
     max_points: int,
+    dimension: int,
 ) -> Iterable[np.ndarray]:
     generator = DATASET_GENERATORS[dataset]
     for _ in range(n_samples):
         n = rng.integers(min_points, max_points + 1)
-        yield generator(rng, int(n))
+        yield generator(rng, int(n), dimension)
 
 
 def summarize(values: List[float]) -> str:
@@ -228,6 +229,7 @@ def benchmark(
     random_extents: int,
     mvee_kwargs: Dict[str, int],
     deephull_kwargs: Optional[Dict[str, float]] = None,
+    dimension: int = 2,
 ) -> None:
     rng = np.random.default_rng(seed)
     if ConvexHullviaDeepHull is not None:
@@ -235,16 +237,18 @@ def benchmark(
     else:
         deephull_model = None
 
-    method_fns = {
-        "Extents": lambda pts: run_extents(pts, random_samples=random_extents),
-        "MVEE": lambda pts: run_mvee(pts, **mvee_kwargs),
-    }
+    method_fns = {}
+    if dimension == 2:
+        method_fns["Extents"] = lambda pts: run_extents(pts, random_samples=random_extents)
+    else:
+        print(f"[INFO] Skipping Extents solver for dimension {dimension}; implemented only for 2D.")
+    method_fns["MVEE"] = lambda pts: run_mvee(pts, **mvee_kwargs)
     if deephull_model is not None:
         method_fns["DeepHull"] = lambda pts: run_deephull(pts, deephull_model)
 
     for dataset in dataset_names:
         per_method: Dict[str, List[Metrics]] = {name: [] for name in method_fns}
-        for points in iterate_point_sets(rng, dataset, n_samples, min_points, max_points):
+        for points in iterate_point_sets(rng, dataset, n_samples, min_points, max_points, dimension):
             gt_hull = ConvexHull(points)
             for method_name, predict_fn in method_fns.items():
                 start = time.perf_counter()
@@ -292,6 +296,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of random directions used by the Extents method.")
     parser.add_argument("--mvee-m", type=int, default=8, help="Number of directions sampled for MVEE.")
     parser.add_argument("--mvee-kappa", type=int, default=45, help="Concentration parameter for MVEE sampling.")
+    parser.add_argument("--dimension", type=int, default=2,
+                        help="Ambient dimensionality of the generated point clouds.")
     parser.add_argument("--deephull-epochs", type=int, default=200, help="Training epochs for DeepHull.")
     parser.add_argument("--deephull-lambda", type=float, default=2.0, help="Negative sample weight for DeepHull.")
     parser.add_argument("--deephull-epsilon", type=float, default=0.05,
@@ -318,4 +324,5 @@ if __name__ == "__main__":
             "lambda_neg": args.deephull_lambda,
             "level_set_epsilon": args.deephull_epsilon,
         },
+        dimension=args.dimension,
     )

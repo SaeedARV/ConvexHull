@@ -32,7 +32,7 @@ metrics against SciPy’s exact hull:
 
 ```bash
 python3 benchmark_convex_hulls.py --datasets uniform,gaussian,annulus \
-    --samples 200 --min-points 50 --max-points 50
+    --samples 200 --min-points 50 --max-points 50 --dimension 5
 ```
 
 Key columns in the output table:
@@ -45,4 +45,5 @@ Key columns in the output table:
 
 DeepHull results appear automatically when PyTorch is installed. Additional
 training controls are exposed via command-line flags such as
-`--deephull-epochs`, `--deephull-lambda`, and `--deephull-epsilon`.
+`--deephull-epochs`, `--deephull-lambda`, `--deephull-epsilon`, and `--dimension`
+for higher-dimensional benchmarks (note: the Extents solver is limited to 2D).
