@@ -67,6 +67,31 @@ class InputConvexNetwork(nn.Module):
         return output.squeeze(-1)
 
 
+class MaxAffineDeepHull(nn.Module):
+    """
+    Max-affine convex model:
+        f(x) = max_i (a_i^T x + b_i)
+    """
+
+    def __init__(self, input_dim: int, num_planes: int):
+        super().__init__()
+        if num_planes <= 0:
+            raise ValueError("num_planes must be positive.")
+        self.num_planes = num_planes
+        self.weight = nn.Parameter(torch.empty(num_planes, input_dim))
+        self.bias = nn.Parameter(torch.zeros(num_planes))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # scores shape: (batch, num_planes), gradients flow through active facet.
+        scores = F.linear(inputs, self.weight, self.bias)
+        return torch.max(scores, dim=-1).values
+
+
 class BoundaryGenerator(nn.Module):
     """
     Generator that proposes challenging negatives close to the decision boundary.
@@ -102,12 +127,14 @@ class TrainingStats:
 
 class ConvexHullviaDeepHull:
     """
-    DeepHull solver that approximates a convex hull through an input-convex network.
+    DeepHull solver approximating a convex hull via either an ICNN or a max-affine model.
     """
 
     def __init__(
         self,
+        method: str = "icnn",
         hidden_sizes: Sequence[int] = (64, 64, 64),
+        maso_facets: int = 64,
         generator_hidden: Sequence[int] = (64, 64),
         noise_dim: int = 16,
         max_epochs: int = 250,
@@ -119,7 +146,12 @@ class ConvexHullviaDeepHull:
         max_grad_norm: Optional[float] = None,
         device: Optional[str] = None,
     ):
+        method = method.lower()
+        if method not in {"icnn", "maso"}:
+            raise ValueError("method must be 'icnn' or 'maso'.")
         self.hidden_sizes = tuple(hidden_sizes)
+        self.method = method
+        self.maso_facets = int(maso_facets)
         self.generator_hidden = tuple(generator_hidden)
         self.noise_dim = int(noise_dim)
         self.max_epochs = int(max_epochs)
@@ -134,7 +166,7 @@ class ConvexHullviaDeepHull:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        self.model: Optional[InputConvexNetwork] = None
+        self.model: Optional[nn.Module] = None
         self.generator: Optional[BoundaryGenerator] = None
         self.normaliser_mean: Optional[np.ndarray] = None
         self.normaliser_std: Optional[np.ndarray] = None
@@ -154,7 +186,10 @@ class ConvexHullviaDeepHull:
         return mean, std
 
     def _initialise_models(self, dim: int) -> None:
-        self.model = InputConvexNetwork(dim, self.hidden_sizes).to(self.device)
+        if self.method == "icnn":
+            self.model = InputConvexNetwork(dim, self.hidden_sizes).to(self.device)
+        else:
+            self.model = MaxAffineDeepHull(dim, self.maso_facets).to(self.device)
         self.generator = BoundaryGenerator(
             noise_dim=self.noise_dim,
             output_dim=dim,

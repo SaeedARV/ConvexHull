@@ -12,7 +12,7 @@ import math
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
@@ -228,21 +228,25 @@ def benchmark(
     seed: int,
     random_extents: int,
     mvee_kwargs: Dict[str, int],
-    deephull_kwargs: Optional[Dict[str, float]] = None,
+    deephull_kwargs: Optional[Dict[str, Any]] = None,
     dimension: int = 2,
+    deephull_methods: Optional[Sequence[str]] = None,
 ) -> None:
     rng = np.random.default_rng(seed)
-    if ConvexHullviaDeepHull is not None:
-        deephull_model = ConvexHullviaDeepHull(**(deephull_kwargs or {}))
-    else:
-        deephull_model = None
+    deephull_models: List[Tuple[str, ConvexHullviaDeepHull]] = []
+    if ConvexHullviaDeepHull is not None and deephull_methods:
+        base_kwargs = dict(deephull_kwargs or {})
+        for method in deephull_methods:
+            model = ConvexHullviaDeepHull(method=method, **base_kwargs)
+            label = f"DeepHull-{method.upper()}"
+            deephull_models.append((label, model))
 
     method_fns = {}
-    
+
     method_fns["Extents"] = lambda pts: run_extents(pts, random_samples=random_extents)
     method_fns["MVEE"] = lambda pts: run_mvee(pts, **mvee_kwargs)
-    if deephull_model is not None:
-        method_fns["DeepHull"] = lambda pts: run_deephull(pts, deephull_model)
+    for name, model in deephull_models:
+        method_fns[name] = (lambda pts, mdl=model: run_deephull(pts, mdl))
 
     for dataset in dataset_names:
         per_method: Dict[str, List[Metrics]] = {name: [] for name in method_fns}
@@ -300,6 +304,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deephull-lambda", type=float, default=2.0, help="Negative sample weight for DeepHull.")
     parser.add_argument("--deephull-epsilon", type=float, default=0.05,
                         help="Tolerance used to collect points near the learned decision boundary.")
+    parser.add_argument("--deephull-method", type=str, default="icnn",
+                        help="DeepHull backend(s): 'icnn', 'maso', 'both', or comma-separated list.")
+    parser.add_argument("--deephull-maso-facets", type=int, default=64,
+                        help="Number of affine facets for the MASO DeepHull variant.")
     return parser.parse_args()
 
 
@@ -309,6 +317,19 @@ if __name__ == "__main__":
     unknown = [name for name in dataset_list if name not in DATASET_GENERATORS]
     if unknown:
         raise SystemExit(f"Unknown dataset types: {', '.join(unknown)}")
+    raw_methods = [token.strip().lower() for token in args.deephull_method.split(",") if token.strip()]
+    if not raw_methods:
+        raw_methods = ["icnn"]
+    if "both" in raw_methods:
+        raw_methods = ["icnn", "maso"]
+    valid_methods = {"icnn", "maso"}
+    invalid = [m for m in raw_methods if m not in valid_methods]
+    if invalid:
+        raise SystemExit(f"Unknown DeepHull methods: {', '.join(invalid)}")
+    deephull_methods = []
+    for method in raw_methods:
+        if method not in deephull_methods:
+            deephull_methods.append(method)
     benchmark(
         dataset_names=dataset_list,
         n_samples=args.samples,
@@ -321,6 +342,8 @@ if __name__ == "__main__":
             "max_epochs": args.deephull_epochs,
             "lambda_neg": args.deephull_lambda,
             "level_set_epsilon": args.deephull_epsilon,
+            "maso_facets": args.deephull_maso_facets,
         },
         dimension=args.dimension,
+        deephull_methods=deephull_methods,
     )
