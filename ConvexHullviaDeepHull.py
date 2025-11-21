@@ -19,12 +19,14 @@ def _to_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
 class NonNegativeLinear(nn.Module):
     """
     Linear layer with non-negative weights enforced via softplus reparameterisation.
+    Optionally constrains each row's norm to maintain a Lipschitz bound.
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, max_norm: Optional[float] = None):
         super().__init__()
         self.weight_raw = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.max_norm = max_norm
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -32,8 +34,45 @@ class NonNegativeLinear(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
+    def _apply_norm_constraint(self, weight: torch.Tensor) -> torch.Tensor:
+        if self.max_norm is None:
+            return weight
+        row_norm = weight.norm(p=2, dim=1, keepdim=True).clamp(min=1e-9)
+        scale = torch.clamp(self.max_norm / row_norm, max=1.0)
+        return weight * scale
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         weight = F.softplus(self.weight_raw)
+        weight = self._apply_norm_constraint(weight)
+        return F.linear(inputs, weight, self.bias)
+
+
+class LipschitzLinear(nn.Module):
+    """
+    Linear layer that optionally enforces per-row norm constraints for Lipschitz control.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, max_norm: Optional[float] = None):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.max_norm = max_norm
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def _apply_norm_constraint(self, weight: torch.Tensor) -> torch.Tensor:
+        if self.max_norm is None:
+            return weight
+        row_norm = weight.norm(p=2, dim=1, keepdim=True).clamp(min=1e-9)
+        scale = torch.clamp(self.max_norm / row_norm, max=1.0)
+        return weight * scale
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        weight = self._apply_norm_constraint(self.weight)
         return F.linear(inputs, weight, self.bias)
 
 
@@ -57,7 +96,8 @@ class InputConvexNetwork(nn.Module):
             self.hidden_from_input.append(NonNegativeLinear(input_dim, out_size))
 
         self.output_layer = NonNegativeLinear(hidden_sizes[-1], 1, bias=True)
-        self.activation = nn.LeakyReLU(negative_slope=0.01)
+        # Theory-consistent monotone convex activation.
+        self.activation = nn.ReLU()
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         z = self.activation(self.first(inputs))
@@ -67,35 +107,80 @@ class InputConvexNetwork(nn.Module):
         return output.squeeze(-1)
 
 
-class MaxAffineDeepHull(nn.Module):
+class OriginalDeepHull(nn.Module):
     """
-    Max-affine convex model:
-        f(x) = max_i (a_i^T x + b_i)
+    Wrapper that keeps the original DeepHull ICNN architecture unchanged.
     """
 
-    def __init__(self, input_dim: int, num_planes: int):
+    def __init__(self, input_dim: int, hidden_sizes: Sequence[int]):
         super().__init__()
-        if num_planes <= 0:
-            raise ValueError("num_planes must be positive.")
-        self.num_planes = num_planes
-        self.weight = nn.Parameter(torch.empty(num_planes, input_dim))
-        self.bias = nn.Parameter(torch.zeros(num_planes))
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.weight)
-        nn.init.zeros_(self.bias)
+        self.icnn = InputConvexNetwork(input_dim, hidden_sizes)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # scores shape: (batch, num_planes), gradients flow through active facet.
-        scores = F.linear(inputs, self.weight, self.bias)
-        return torch.max(scores, dim=-1).values
+        return self.icnn(inputs)
+
+
+class ConvexDeepHull(nn.Module):
+    """
+    Learning-theoretic convex DeepHull: smooth ICNN with Lipschitz-constrained weights.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_sizes: Sequence[int],
+        lipschitz_constant: float = 1.0,
+        activation: str = "softplus",
+    ):
+        super().__init__()
+        if not hidden_sizes:
+            raise ValueError("hidden_sizes must contain at least one layer.")
+        self.lipschitz_constant = float(lipschitz_constant)
+        if self.lipschitz_constant <= 0:
+            raise ValueError("lipschitz_constant must be positive.")
+        act = activation.lower()
+        if act == "softplus":
+            self.activation = nn.Softplus()
+        elif act == "relu":
+            self.activation = nn.ReLU()
+        else:
+            raise ValueError("activation must be 'softplus' or 'relu'.")
+
+        self.first = LipschitzLinear(input_dim, hidden_sizes[0], bias=True, max_norm=self.lipschitz_constant)
+        self.hidden_from_prev = nn.ModuleList()
+        self.hidden_from_input = nn.ModuleList()
+        for idx in range(len(hidden_sizes) - 1):
+            in_size = hidden_sizes[idx]
+            out_size = hidden_sizes[idx + 1]
+            self.hidden_from_prev.append(
+                NonNegativeLinear(in_size, out_size, bias=True, max_norm=self.lipschitz_constant)
+            )
+            self.hidden_from_input.append(
+                LipschitzLinear(input_dim, out_size, bias=True, max_norm=self.lipschitz_constant)
+            )
+        self.output_layer = NonNegativeLinear(hidden_sizes[-1], 1, bias=True, max_norm=self.lipschitz_constant)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        z = self.activation(self.first(inputs))
+        for layer_prev, layer_input in zip(self.hidden_from_prev, self.hidden_from_input):
+            z = self.activation(layer_prev(z) + layer_input(inputs))
+        output = self.output_layer(z)
+        return output.squeeze(-1)
+
+
+def get_deephull_model(method: str, input_dim: int, hidden_sizes: Sequence[int], lipschitz_constant: float) -> nn.Module:
+    method_lower = method.lower()
+    if method_lower == "original":
+        return OriginalDeepHull(input_dim, hidden_sizes)
+    if method_lower == "convex":
+        return ConvexDeepHull(input_dim, hidden_sizes, lipschitz_constant=lipschitz_constant)
+    raise ValueError("method must be 'original' or 'convex'.")
 
 
 class BoundaryGenerator(nn.Module):
     """
     Generator that proposes challenging negatives close to the decision boundary.
-    Outputs live in the normalised data space.
+    Outputs live in the normalised data space; radius is set by the trainer based on data scale.
     """
 
     def __init__(self, noise_dim: int, output_dim: int, hidden_sizes: Sequence[int], radius: float):
@@ -127,40 +212,41 @@ class TrainingStats:
 
 class ConvexHullviaDeepHull:
     """
-    DeepHull solver approximating a convex hull via either an ICNN or a max-affine model.
+    DeepHull solver approximating a convex hull via either the original ICNN or a convex Lipschitz ICNN.
     """
 
     def __init__(
         self,
-        method: str = "icnn",
+        method: str = "original",
         hidden_sizes: Sequence[int] = (64, 64, 64),
-        maso_facets: int = 64,
         generator_hidden: Sequence[int] = (64, 64),
         noise_dim: int = 16,
         max_epochs: int = 250,
         batch_size: int = 128,
         lambda_neg: float = 2.0,
         generator_steps: int = 1,
-        generator_radius: float = 3.0,
+        generator_radius: float = 1.2,
         level_set_epsilon: float = 0.05,
         max_grad_norm: Optional[float] = None,
+        lipschitz_constant: float = 1.0,
         device: Optional[str] = None,
     ):
         method = method.lower()
-        if method not in {"icnn", "maso"}:
-            raise ValueError("method must be 'icnn' or 'maso'.")
+        if method not in {"original", "convex"}:
+            raise ValueError("method must be 'original' or 'convex'.")
         self.hidden_sizes = tuple(hidden_sizes)
         self.method = method
-        self.maso_facets = int(maso_facets)
         self.generator_hidden = tuple(generator_hidden)
         self.noise_dim = int(noise_dim)
         self.max_epochs = int(max_epochs)
         self.batch_size = int(batch_size)
         self.lambda_neg = float(lambda_neg)
         self.generator_steps = int(generator_steps)
-        self.generator_radius = float(generator_radius)
+        # Fixed theoretical scale: radius = 1.2 * max_i ||x_i|| after normalisation.
+        self.generator_radius = 1.2
         self.level_set_epsilon = float(level_set_epsilon)
         self.max_grad_norm = max_grad_norm
+        self.lipschitz_constant = float(lipschitz_constant)
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -185,16 +271,26 @@ class ConvexHullviaDeepHull:
         std = np.where(std < 1e-6, 1.0, std)
         return mean, std
 
-    def _initialise_models(self, dim: int) -> None:
-        if self.method == "icnn":
-            self.model = InputConvexNetwork(dim, self.hidden_sizes).to(self.device)
-        else:
-            self.model = MaxAffineDeepHull(dim, self.maso_facets).to(self.device)
+    def _compute_generator_radius(self, normalised: np.ndarray) -> float:
+        norms = np.linalg.norm(normalised, axis=1)
+        max_norm = float(np.max(norms)) if norms.size else 0.0
+        if not np.isfinite(max_norm) or max_norm <= 0:
+            max_norm = 1.0
+        # Theory-prescribed coverage: radius = 1.2 * max_i ||x_i|| in normalised space.
+        return float(self.generator_radius * max_norm)
+
+    def _initialise_models(self, dim: int, generator_radius: float) -> None:
+        self.model = get_deephull_model(
+            method=self.method,
+            input_dim=dim,
+            hidden_sizes=self.hidden_sizes,
+            lipschitz_constant=self.lipschitz_constant,
+        ).to(self.device)
         self.generator = BoundaryGenerator(
             noise_dim=self.noise_dim,
             output_dim=dim,
             hidden_sizes=self.generator_hidden,
-            radius=self.generator_radius,
+            radius=generator_radius,
         ).to(self.device)
 
     def fit(self, points: Sequence[Sequence[float]]) -> None:
@@ -207,8 +303,10 @@ class ConvexHullviaDeepHull:
         n_points, dim = array.shape
         self.normaliser_mean, self.normaliser_std = self._compute_normaliser(array)
         normalised = self._normalise(array)
+        # Scale generator radius to the data: Option (A) from the spec.
+        generator_radius = self._compute_generator_radius(normalised)
 
-        self._initialise_models(dim)
+        self._initialise_models(dim, generator_radius=generator_radius)
         assert self.model is not None and self.generator is not None
         hull_net = self.model
         generator = self.generator
@@ -237,14 +335,14 @@ class ConvexHullviaDeepHull:
                 batch_pos = batch_pos.to(self.device)
                 batch_size = batch_pos.shape[0]
 
-                # Generator update(s)
+                # Generator ascends hull logits to locate hard negatives close to the boundary.
                 for _ in range(self.generator_steps):
                     noise = torch.randn(batch_size, self.noise_dim, device=self.device)
                     generator_opt.zero_grad(set_to_none=True)
                     hull_opt.zero_grad(set_to_none=True)
                     generated = generator(noise)
                     logits = hull_net(generated)
-                    generator_loss = -torch.mean(torch.sigmoid(logits))
+                    generator_loss = -torch.mean(logits)
                     generator_loss.backward()
                     if self.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(generator.parameters(), self.max_grad_norm)
@@ -265,8 +363,8 @@ class ConvexHullviaDeepHull:
 
                 loss_pos = F.binary_cross_entropy_with_logits(logits_pos, labels_pos)
                 loss_neg = F.binary_cross_entropy_with_logits(logits_neg, labels_neg)
-                boundary_term = torch.mean(torch.sigmoid(logits_neg))
-                loss = loss_pos + self.lambda_neg * loss_neg + boundary_term
+                # Theory-specified DeepHull objective: L_pos + lambda * L_neg (no extra boundary term).
+                loss = loss_pos + self.lambda_neg * loss_neg
 
                 loss.backward()
                 if self.max_grad_norm is not None:
@@ -275,7 +373,7 @@ class ConvexHullviaDeepHull:
 
                 pos_losses.append(float(loss_pos.item()))
                 neg_losses.append(float(loss_neg.item()))
-                adv_terms.append(float(boundary_term.item()))
+                adv_terms.append(float(torch.sigmoid(logits_neg.detach()).mean().item()))
 
             if not pos_losses:
                 continue

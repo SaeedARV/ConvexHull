@@ -304,10 +304,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deephull-lambda", type=float, default=2.0, help="Negative sample weight for DeepHull.")
     parser.add_argument("--deephull-epsilon", type=float, default=0.05,
                         help="Tolerance used to collect points near the learned decision boundary.")
-    parser.add_argument("--deephull-method", type=str, default="icnn",
-                        help="DeepHull backend(s): 'icnn', 'maso', 'both', or comma-separated list.")
-    parser.add_argument("--deephull-maso-facets", type=int, default=64,
-                        help="Number of affine facets for the MASO DeepHull variant.")
+    parser.add_argument("--deephull-method", type=str, default="original",
+                        help="DeepHull backend(s): 'original', 'convex', 'both', or comma-separated list.")
+    parser.add_argument("--deephull-lipschitz", type=float, default=1.0,
+                        help="Lipschitz constant used by the convex DeepHull ICNN.")
     return parser.parse_args()
 
 
@@ -319,10 +319,10 @@ if __name__ == "__main__":
         raise SystemExit(f"Unknown dataset types: {', '.join(unknown)}")
     raw_methods = [token.strip().lower() for token in args.deephull_method.split(",") if token.strip()]
     if not raw_methods:
-        raw_methods = ["icnn"]
+        raw_methods = ["original"]
     if "both" in raw_methods:
-        raw_methods = ["icnn", "maso"]
-    valid_methods = {"icnn", "maso"}
+        raw_methods = ["original", "convex"]
+    valid_methods = {"original", "convex"}
     invalid = [m for m in raw_methods if m not in valid_methods]
     if invalid:
         raise SystemExit(f"Unknown DeepHull methods: {', '.join(invalid)}")
@@ -342,7 +342,7 @@ if __name__ == "__main__":
             "max_epochs": args.deephull_epochs,
             "lambda_neg": args.deephull_lambda,
             "level_set_epsilon": args.deephull_epsilon,
-            "maso_facets": args.deephull_maso_facets,
+            "lipschitz_constant": args.deephull_lipschitz,
         },
         dimension=args.dimension,
         deephull_methods=deephull_methods,

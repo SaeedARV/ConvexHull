@@ -6,20 +6,21 @@ deep learning baseline.
 - `ConvexHullviaExtents` — deterministic sampling of directional extents (supports any dimension).
 - `ConvexHullviaMVEE` — MVEE-based approximation.
 - `ConvexHullviaDeepHull` — DeepHull with selectable backends: the original ICNN
-  or a max-affine (MASO) model.
+  or a smooth convex Lipschitz ICNN.
 
 The DeepHull solver trains a convex function through an adversarial
 classification loss, producing a tight convex hull approximation directly from
 the supplied points. Install PyTorch to enable this method; the implementation
 automatically falls back to CPU when GPU acceleration is not available. Choose
-between the ICNN and MASO backends via the `method` argument.
+between the baseline ICNN (`method="original"`) and the learning-theoretic
+convex variant (`method="convex"`) via the `method` argument.
 
 ```python
 import numpy as np
 from ConvexHullviaDeepHull import ConvexHullviaDeepHull
 
 points = np.random.rand(30, 3)
-deephull = ConvexHullviaDeepHull(max_epochs=150, method="maso", maso_facets=128)
+deephull = ConvexHullviaDeepHull(max_epochs=150, method="convex", lipschitz_constant=1.0)
 vertex_indices = deephull.predict_indices(points)
 approx_points = points[vertex_indices]
 ```
@@ -46,7 +47,7 @@ Key columns in the output table:
 DeepHull results appear automatically when PyTorch is installed. Additional
 training controls are exposed via command-line flags such as
 `--deephull-epochs`, `--deephull-lambda`, `--deephull-epsilon`,
-`--deephull-method`, `--deephull-maso-facets`, and `--dimension`
+`--deephull-method`, `--deephull-lipschitz`, and `--dimension`
 for higher-dimensional benchmarks. Use `--deephull-method both` (or a
-comma-separated list like `icnn,maso`) to benchmark both DeepHull variants in a
+comma-separated list like `original,convex`) to benchmark both DeepHull variants in a
 single run.
