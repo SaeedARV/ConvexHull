@@ -1,19 +1,41 @@
 import numpy as np
 import cvxpy as cp
 import random
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+import torch
 
 np.random.seed(41)
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
 random.seed(41)
+torch.manual_seed(41)
+
+
+def _select_device(requested: Optional[str] = None) -> torch.device:
+    if requested is not None:
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 class Ellipsoid:
-    def __init__(self, points, center=None, shape_matrix=None, method="Khachiyan"):
+    def __init__(
+        self,
+        points,
+        center=None,
+        shape_matrix=None,
+        method="Khachiyan",
+        device: Optional[str] = None,
+    ):
         """
         Initialize the Ellipsoid with a set of points, center, and shape matrix.
         If center and shape_matrix are not provided, they will be computed.
         """
+        self.device = _select_device(device)
+        self.dtype = torch.float32 if self.device.type in {"cuda", "mps"} else torch.float64
         self.points = np.asarray(points)
         self.n, self.d = self.points.shape
 
@@ -22,6 +44,12 @@ class Ellipsoid:
         else:
             self.center = np.asarray(center)
             self.shape_matrix = np.asarray(shape_matrix)
+            self._refresh_tensors()
+
+    def _refresh_tensors(self) -> None:
+        self._points_tensor = torch.as_tensor(self.points, device=self.device, dtype=self.dtype)
+        self._center_tensor = torch.as_tensor(self.center, device=self.device, dtype=self.dtype)
+        self._shape_matrix_tensor = torch.as_tensor(self.shape_matrix, device=self.device, dtype=self.dtype)
 
     def SDP_minimum_volume_enclosing_ellipsoid(self, tol: float = 1e-3):
         """
@@ -122,6 +150,42 @@ class Ellipsoid:
 
         return c, A
 
+    def khachiyan_minimum_volume_enclosing_ellipsoid_torch(
+        self, tol: float = 1e-5, max_iter: int = 1000
+    ):
+        """
+        Torch version of Khachiyan’s algorithm to enable GPU (CUDA/MPS) execution.
+        """
+        P = torch.as_tensor(self.points, device=self.device, dtype=self.dtype)
+        N, d = P.shape
+
+        Q = torch.vstack([P.t(), torch.ones(1, N, device=self.device, dtype=self.dtype)])
+        u = torch.full((N,), 1.0 / N, device=self.device, dtype=self.dtype)
+
+        for _ in range(max_iter):
+            V = Q @ torch.diag(u) @ Q.t()
+            invV = torch.linalg.inv(V)
+            QT = Q.t()
+            M = torch.sum((QT @ invV) * QT, dim=1)
+            j = torch.argmax(M)
+            max_M = M[j]
+
+            step = (max_M - d - 1) / ((d + 1) * (max_M - 1))
+            new_u = (1 - step) * u
+            new_u = new_u.clone()
+            new_u[j] = new_u[j] + step
+
+            if torch.linalg.norm(new_u - u).item() < tol:
+                u = new_u
+                break
+            u = new_u
+
+        c = P.t() @ u
+        cov = (P.t() * u) @ P - torch.outer(c, c)
+        A = torch.linalg.inv(cov) / d
+
+        return c.detach().cpu().numpy(), A.detach().cpu().numpy()
+
     def minimum_enclosing_sphere(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Computes the minimum‐enclosing sphere of self.points via Welzl’s algorithm.
@@ -186,21 +250,38 @@ class Ellipsoid:
         Uses either Khachiyan's algorithm or a CVXPY-based approach.
         """
         if method == "Khachiyan":
-            return self.khachiyan_minimum_volume_enclosing_ellipsoid()
+            center, shape = (
+                self.khachiyan_minimum_volume_enclosing_ellipsoid_torch()
+                if self.device.type != "cpu"
+                else self.khachiyan_minimum_volume_enclosing_ellipsoid()
+            )
         elif method == "SDP":
-            return self.SDP_minimum_volume_enclosing_ellipsoid()
+            center, shape = self.SDP_minimum_volume_enclosing_ellipsoid()
         elif method == "Sphere":
-            return self.minimum_enclosing_sphere()
+            center, shape = self.minimum_enclosing_sphere()
         else:
             raise ValueError(
                 "Unknown method for computing MVEE. Use 'Khachiyan' or 'CVXPY'."
             )
+        self.center = np.asarray(center)
+        self.shape_matrix = np.asarray(shape)
+        self._refresh_tensors()
+        return self.center, self.shape_matrix
 
     def project(self, x, tol=1e-6, max_iter=100):
         """
         Project point x onto the surface of the ellipsoid defined by
         (y - center)^T shape_matrix^-1 (y - center) = 1.
         """
+        use_torch = self.device.type not in {"cpu", "mps"}
+        if use_torch:
+            try:
+                return self._project_torch(x, tol=tol, max_iter=max_iter)
+            except (RuntimeError, NotImplementedError):
+                # Fallback to CPU path when an op is unsupported (e.g., MPS linalg.eigh).
+                pass
+        if torch.is_tensor(x):
+            x = x.detach().cpu().numpy()
         x = np.asarray(x)
         z = x - self.center
 
@@ -250,6 +331,50 @@ class Ellipsoid:
         w = y / (1.0 + lam * e)
         return U @ w + self.center
 
+    def _project_torch(self, x, tol: float, max_iter: int) -> np.ndarray:
+        x_t = torch.as_tensor(x, device=self.device, dtype=self.dtype)
+        z = x_t - self._center_tensor
+
+        e, U = torch.linalg.eigh(self._shape_matrix_tensor)
+        y = U.t() @ z
+
+        def phi(lam: torch.Tensor) -> torch.Tensor:
+            return torch.sum(e * y**2 / (1.0 + lam * e) ** 2) - 1.0
+
+        def phi_prime(lam: torch.Tensor) -> torch.Tensor:
+            return -2.0 * torch.sum(e**2 * y**2 / (1.0 + lam * e) ** 3)
+
+        lam0 = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        f0 = phi(lam0)
+        lam_min = -1.0 / torch.max(e) + 1e-12
+
+        if f0.item() > 0:
+            lam_lo, lam_hi = lam0, torch.tensor(1.0, device=self.device, dtype=self.dtype)
+            while phi(lam_hi).item() > 0:
+                lam_hi *= 2.0
+        else:
+            lam_lo, lam_hi = lam_min, lam0
+
+        lam = 0.5 * (lam_lo + lam_hi)
+        for _ in range(max_iter):
+            f = phi(lam)
+            if torch.abs(f).item() < tol:
+                break
+            df = phi_prime(lam)
+            lam_new = lam - f / df
+            lam_new_val = lam_new.item()
+            if not (lam_lo.item() < lam_new_val < lam_hi.item()):
+                lam_new = 0.5 * (lam_lo + lam_hi)
+            if phi(lam_new).item() > 0:
+                lam_lo = lam_new
+            else:
+                lam_hi = lam_new
+            lam = lam_new
+
+        w = y / (1.0 + lam * e)
+        projected = U @ w + self._center_tensor
+        return projected.detach().cpu().numpy()
+
     def normal_vector(self, v: np.ndarray) -> np.ndarray:
         """
         Given an ellipsoid E = { x : (x - c)^T A (x - c) = 1 } (with A ≻ 0),
@@ -268,6 +393,12 @@ class Ellipsoid:
         Returns:
                 u: unit normal vector at v, shape (d,)
         """
+
+        if self.device.type != "cpu" or torch.is_tensor(v):
+            v_t = torch.as_tensor(v, device=self.device, dtype=self.dtype)
+            w_t = self._shape_matrix_tensor @ (v_t - self._center_tensor)
+            w_t = w_t / torch.linalg.norm(w_t)
+            return w_t.detach().cpu().numpy()
 
         def normalize(v):
             return v / np.linalg.norm(v)

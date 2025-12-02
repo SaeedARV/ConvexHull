@@ -29,6 +29,18 @@ except ModuleNotFoundError:
 ArrayLike = Sequence[Sequence[float]]
 
 
+def _select_device(requested: Optional[str] = None):
+    import torch
+
+    if requested is not None:
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 @dataclass
 class Metrics:
     vertex_precision: float
@@ -132,8 +144,8 @@ def evaluate_prediction(points: np.ndarray, gt_hull: ConvexHull, candidate_indic
     )
 
 
-def run_extents(points: np.ndarray, random_samples: int = 2048) -> List[int]:
-    solver = ConvexHullviaExtents(points)
+def run_extents(points: np.ndarray, random_samples: int = 2048, device: Optional[str] = None) -> List[int]:
+    solver = ConvexHullviaExtents(points, device=device)
     _, approx_set = solver.get_random_extents(random_samples, return_approx_hull=True)
     if not approx_set:
         return []
@@ -143,8 +155,8 @@ def run_extents(points: np.ndarray, random_samples: int = 2048) -> List[int]:
     return ordered
 
 
-def run_mvee(points: np.ndarray, **kwargs) -> List[int]:
-    solver = ConvexHullviaMVEE(points)
+def run_mvee(points: np.ndarray, device: Optional[str] = None, **kwargs) -> List[int]:
+    solver = ConvexHullviaMVEE(points, device=device)
     result = solver.compute(return_extents=True, **kwargs)
     approx = result[0] if isinstance(result, tuple) else result
     if approx.shape[0] < 3:
@@ -231,26 +243,41 @@ def benchmark(
     deephull_kwargs: Optional[Dict[str, Any]] = None,
     dimension: int = 2,
     deephull_methods: Optional[Sequence[str]] = None,
+    device_extents: Optional[str] = None,
+    device_mvee: Optional[str] = None,
+    device_deephull: Optional[str] = None,
+    log_interval: int = 50,
+    verbose: bool = False,
 ) -> None:
     rng = np.random.default_rng(seed)
+    chosen_extents_device = str(_select_device(device_extents))
+    chosen_mvee_device = str(_select_device(device_mvee))
+    chosen_deephull_device = str(_select_device(device_deephull))
+    if verbose:
+        print(
+            f"[config] Extents device={chosen_extents_device}, "
+            f"MVEE device={chosen_mvee_device}, "
+            f"DeepHull device={chosen_deephull_device}"
+        )
+
     deephull_models: List[Tuple[str, ConvexHullviaDeepHull]] = []
     if ConvexHullviaDeepHull is not None and deephull_methods:
         base_kwargs = dict(deephull_kwargs or {})
         for method in deephull_methods:
-            model = ConvexHullviaDeepHull(method=method, **base_kwargs)
+            model = ConvexHullviaDeepHull(method=method, device=device_deephull, **base_kwargs)
             label = f"DeepHull-{method.upper()}"
             deephull_models.append((label, model))
 
     method_fns = {}
 
-    method_fns["Extents"] = lambda pts: run_extents(pts, random_samples=random_extents)
-    method_fns["MVEE"] = lambda pts: run_mvee(pts, **mvee_kwargs)
+    method_fns["Extents"] = lambda pts: run_extents(pts, random_samples=random_extents, device=device_extents)
+    method_fns["MVEE"] = lambda pts: run_mvee(pts, device=device_mvee, **mvee_kwargs)
     for name, model in deephull_models:
         method_fns[name] = (lambda pts, mdl=model: run_deephull(pts, mdl))
 
     for dataset in dataset_names:
         per_method: Dict[str, List[Metrics]] = {name: [] for name in method_fns}
-        for points in iterate_point_sets(rng, dataset, n_samples, min_points, max_points, dimension):
+        for idx, points in enumerate(iterate_point_sets(rng, dataset, n_samples, min_points, max_points, dimension), 1):
             gt_hull = ConvexHull(points)
             for method_name, predict_fn in method_fns.items():
                 start = time.perf_counter()
@@ -263,6 +290,8 @@ def benchmark(
                 metrics = evaluate_prediction(points, gt_hull, candidate)
                 metrics.runtime_ms = runtime_ms
                 per_method[method_name].append(metrics)
+            if log_interval > 0 and idx % log_interval == 0:
+                print(f"[info] {dataset}: processed {idx}/{n_samples} samples...")
 
         headers = ["Method", "Vertex F1", "Precision", "Recall", "Area ratio", "Coverage", "Vertices", "Runtime (ms)"]
         rows: List[List[str]] = []
@@ -308,6 +337,15 @@ def parse_args() -> argparse.Namespace:
                         help="DeepHull backend(s): 'original', 'convex', 'both', or comma-separated list.")
     parser.add_argument("--deephull-lipschitz", type=float, default=1.0,
                         help="Lipschitz constant used by the convex DeepHull ICNN.")
+    parser.add_argument("--device-extents", type=str, default=None,
+                        help="Device for Extents solver (e.g., cuda, mps, cpu). Defaults to auto.")
+    parser.add_argument("--device-mvee", type=str, default=None,
+                        help="Device for MVEE solver (e.g., cuda, mps, cpu). Defaults to auto.")
+    parser.add_argument("--device-deephull", type=str, default=None,
+                        help="Device for DeepHull solver (e.g., cuda, mps, cpu). Defaults to auto.")
+    parser.add_argument("--log-interval", type=int, default=50,
+                        help="How often to log progress per dataset.")
+    parser.add_argument("--verbose", action="store_true", help="Print device selection and extra info.")
     return parser.parse_args()
 
 
@@ -346,4 +384,9 @@ if __name__ == "__main__":
         },
         dimension=args.dimension,
         deephull_methods=deephull_methods,
+        device_extents=args.device_extents,
+        device_mvee=args.device_mvee,
+        device_deephull=args.device_deephull,
+        log_interval=args.log_interval,
+        verbose=args.verbose,
     )

@@ -12,6 +12,16 @@ torch.manual_seed(41)
 np.random.seed(41)
 
 
+def _select_device(requested: Optional[str] = None) -> torch.device:
+    if requested is not None:
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def _to_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.as_tensor(array, dtype=torch.float32, device=device)
 
@@ -248,9 +258,7 @@ class ConvexHullviaDeepHull:
         self.max_grad_norm = max_grad_norm
         self.lipschitz_constant = float(lipschitz_constant)
 
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+        self.device = _select_device(device)
 
         self.model: Optional[nn.Module] = None
         self.generator: Optional[BoundaryGenerator] = None
