@@ -1,6 +1,4 @@
-.DS_Store
-.ipynb_checkpoints
-__pycache__
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -11,6 +9,5 @@ __pycache__
 *.pyzwz
 *.pyzwzw
 *.pyzwzwz
-
-.uv-cache
-.venv
+*.pyzwzwzw
+*.pyzwzwzwz
