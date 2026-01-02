@@ -27,6 +27,8 @@ import math
 import os
 import time
 import warnings
+import gc
+import multiprocessing
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ from ConvexHullviaMVEE import ConvexHullviaMVEE  # noqa: E402
 
 try:
     from ConvexHullviaDeepHull import ConvexHullviaDeepHull  # type: ignore
+    import torch  # type: ignore
 except ModuleNotFoundError:
     ConvexHullviaDeepHull = None  # type: ignore[assignment]
     warnings.warn("ConvexHullviaDeepHull is unavailable; DeepHull runs will be skipped.", RuntimeWarning)
@@ -132,6 +135,208 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: Sequence[str]) -
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def append_csv_rows(path: str, rows: List[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    if not rows:
+        return
+    import csv
+
+    ensure_dir(os.path.dirname(path))
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def load_csv_rows(
+    path: str,
+    int_fields: Sequence[str] = (),
+    float_fields: Sequence[str] = (),
+) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    import csv
+
+    rows: List[Dict[str, Any]] = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            parsed: Dict[str, Any] = dict(row)
+            valid = True
+            for field in int_fields:
+                value = parsed.get(field, "")
+                if value == "":
+                    valid = False
+                    break
+                try:
+                    parsed[field] = int(float(value))
+                except ValueError:
+                    valid = False
+                    break
+            if not valid:
+                continue
+            for field in float_fields:
+                value = parsed.get(field, "")
+                if value == "":
+                    parsed[field] = math.nan
+                else:
+                    try:
+                        parsed[field] = float(value)
+                    except ValueError:
+                        parsed[field] = math.nan
+            rows.append(parsed)
+    return rows
+
+
+def build_key_set(rows: List[Dict[str, Any]], key_fields: Sequence[str]) -> set[Tuple[Any, ...]]:
+    return {tuple(row[field] for field in key_fields) for row in rows}
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _run_method_worker(
+    method_name: str,
+    points: np.ndarray,
+    method_params: Dict[str, Any],
+    deephull_kwargs: Dict[str, Any],
+) -> MethodResult:
+    if method_name == "Extents":
+        return run_extents(points, **method_params)
+    if method_name == "MVEE":
+        return run_mvee(points, **method_params)
+    if method_name.startswith("DeepHull-"):
+        method = method_name.split("-", 1)[1]
+        return run_deephull(points, method=method, **deephull_kwargs)
+    raise ValueError(f"Unknown method name: {method_name}")
+
+
+def _run_method_worker_entry(
+    queue: multiprocessing.Queue,
+    method_name: str,
+    points: np.ndarray,
+    method_params: Dict[str, Any],
+    deephull_kwargs: Dict[str, Any],
+) -> None:
+    try:
+        result = _run_method_worker(method_name, points, method_params, deephull_kwargs)
+        queue.put(("ok", result))
+    except Exception as exc:
+        queue.put(("error", repr(exc)))
+
+
+def run_method_in_subprocess(
+    method_name: str,
+    points: np.ndarray,
+    method_params: Dict[str, Any],
+    deephull_kwargs: Dict[str, Any],
+) -> MethodResult:
+    ctx = multiprocessing.get_context("spawn")
+    queue: multiprocessing.Queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_run_method_worker_entry,
+        args=(queue, method_name, points, method_params, deephull_kwargs),
+    )
+    proc.start()
+    proc.join()
+    if not queue.empty():
+        status, payload = queue.get()
+        if status == "ok":
+            return payload
+        log(f"  - {method_name}: error {payload}")
+    if proc.exitcode not in (None, 0):
+        log(f"  - {method_name}: subprocess exited with code {proc.exitcode}")
+    return MethodResult(method_name, np.empty((0, points.shape[1])), [], 0.0, status="error")
+
+
+def run_method(
+    method_name: str,
+    points: np.ndarray,
+    method_params: Dict[str, Any],
+    deephull_kwargs: Dict[str, Any],
+    use_subprocess: bool = True,
+) -> MethodResult:
+    if use_subprocess:
+        return run_method_in_subprocess(method_name, points, method_params, deephull_kwargs)
+    return _run_method_worker(method_name, points, method_params, deephull_kwargs)
+
+
+def run_and_log(
+    method_name: str,
+    points: np.ndarray,
+    method_params: Dict[str, Any],
+    deephull_kwargs: Dict[str, Any],
+    use_subprocess: bool = True,
+) -> MethodResult:
+    log(f"  - {method_name}: starting")
+    result = run_method(method_name, points, method_params, deephull_kwargs, use_subprocess=use_subprocess)
+    log(f"  - {method_name}: finished ({result.status}, {result.runtime_ms:.1f} ms)")
+    cleanup_after_method()
+    return result
+
+
+def _metrics_worker_entry(
+    queue: multiprocessing.Queue,
+    seed: int,
+    points: np.ndarray,
+    vertices: np.ndarray,
+) -> None:
+    try:
+        rng = np.random.default_rng(seed)
+        true_hull = ConvexHull(points)
+        metrics = compute_low_dim_metrics(rng, points, true_hull, MethodResult("tmp", vertices, [], 0.0))
+        queue.put(("ok", metrics))
+    except Exception as exc:
+        queue.put(("error", repr(exc)))
+
+
+def compute_low_dim_metrics_safe(
+    rng: np.random.Generator,
+    points: np.ndarray,
+    vertices: np.ndarray,
+) -> Dict[str, Any]:
+    seed = int(rng.integers(0, 2**31 - 1))
+    ctx = multiprocessing.get_context("spawn")
+    queue: multiprocessing.Queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_metrics_worker_entry,
+        args=(queue, seed, points, vertices),
+    )
+    proc.start()
+    proc.join()
+    if not queue.empty():
+        status, payload = queue.get()
+        if status == "ok":
+            return payload
+        log(f"  - metrics error {payload}")
+    if proc.exitcode not in (None, 0):
+        log(f"  - metrics subprocess exited with code {proc.exitcode}")
+    return {
+        "support_error": math.nan,
+        "volume_ratio": math.nan,
+        "volume_true": math.nan,
+        "volume_approx": math.nan,
+        "membership_acc": math.nan,
+        "runtime_ms": math.nan,
+        "n_vertices": int(vertices.shape[0]),
+        "status": "metric_error",
+    }
+
+
+def cleanup_after_method() -> None:
+    gc.collect()
+    if ConvexHullviaDeepHull is not None:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _sanitize_indices(indices: Sequence[int], n_points: int) -> List[int]:
@@ -655,183 +860,410 @@ def run_low_dim_experiments(
     rng: np.random.Generator,
     output_dir: str,
     deephull_kwargs: Dict[str, Any],
+    resume: bool = False,
 ) -> List[Dict[str, Any]]:
     dims = [2, 3, 5, 8]
     ns = [200, 500, 1000]
-    results: List[Dict[str, Any]] = []
+    results_path = os.path.join(output_dir, "low_dim_results.csv")
+    fieldnames = [
+        "dimension",
+        "n_points",
+        "dataset",
+        "method",
+        "support_error",
+        "volume_ratio",
+        "volume_true",
+        "volume_approx",
+        "membership_acc",
+        "runtime_ms",
+        "n_vertices",
+        "status",
+    ]
+    existing_rows = (
+        load_csv_rows(
+            results_path,
+            int_fields=["dimension", "n_points", "n_vertices"],
+            float_fields=[
+                "support_error",
+                "volume_ratio",
+                "volume_true",
+                "volume_approx",
+                "membership_acc",
+                "runtime_ms",
+            ],
+        )
+        if resume
+        else []
+    )
+    if not resume:
+        ensure_dir(output_dir)
+        if os.path.exists(results_path):
+            with open(results_path, "w", encoding="utf-8"):
+                pass
+    existing_keys = build_key_set(existing_rows, ("dimension", "n_points", "dataset", "method")) if resume else set()
 
     plot_samples: Dict[int, Tuple[np.ndarray, ConvexHull, Dict[str, np.ndarray]]] = {}
+    method_names = ["Extents", "MVEE"]
+    if ConvexHullviaDeepHull is not None:
+        method_names.extend(["DeepHull-original", "DeepHull-convex"])
 
     for dim in dims:
         for n in ns:
+            if dim == 8 and n >= 500:
+                log(f"[low] skip d=8 n={n} (excluded due to memory constraints)")
+                continue
             for dataset_name in ["uniform_cube", "gaussian"]:
-                points = DATASET_GENERATORS[dataset_name](rng, n, dim)
-                true_hull = ConvexHull(points)
-                method_outputs: List[MethodResult] = []
-                method_outputs.append(run_extents(points, random_samples=2048))
-                method_outputs.append(run_mvee(points, m=8, kappa=45))
-                for method in ["original", "convex"]:
-                    method_outputs.append(run_deephull(points, method=method, **deephull_kwargs))
-
-                for cond in [1, 10, 100]:
-                    ani_points = generate_anisotropic_gaussian(rng, n, dim, condition=cond)
-                    ani_hull = ConvexHull(ani_points)
-                    ani_outputs: List[MethodResult] = []
-                    ani_outputs.append(run_extents(ani_points, random_samples=2048))
-                    ani_outputs.append(run_mvee(ani_points, m=8, kappa=45))
-                    for method in ["original", "convex"]:
-                        ani_outputs.append(run_deephull(ani_points, method=method, **deephull_kwargs))
-                    for mres in ani_outputs:
+                missing_methods = [
+                    method for method in method_names if (dim, n, dataset_name, method) not in existing_keys
+                ]
+                need_visual = dim in (2, 3) and dim not in plot_samples
+                skip_dataset = resume and not missing_methods and not need_visual
+                if skip_dataset:
+                    log(f"[low] skip d={dim} n={n} dataset={dataset_name} (already in {results_path})")
+                else:
+                    log(f"[low] start d={dim} n={n} dataset={dataset_name}")
+                    points = DATASET_GENERATORS[dataset_name](rng, n, dim)
+                    true_hull = ConvexHull(points)
+                    methods_to_run = method_names if need_visual else missing_methods
+                    approximations: Dict[str, np.ndarray] = {}
+                    for method_name in method_names:
+                        if method_name not in methods_to_run:
+                            continue
+                        if method_name == "Extents":
+                            mres = run_and_log(
+                                "Extents",
+                                points,
+                                {"random_samples": 2048},
+                                deephull_kwargs,
+                            )
+                        elif method_name == "MVEE":
+                            mres = run_and_log(
+                                "MVEE",
+                                points,
+                                {"m": 8, "kappa": 45},
+                                deephull_kwargs,
+                            )
+                        else:
+                            method = method_name.split("-", 1)[1]
+                            mres = run_and_log(method_name, points, {}, deephull_kwargs)
+                        if mres.vertices.size and need_visual:
+                            approximations[mres.method] = mres.vertices
                         if mres.status == "missing":
                             continue
-                        metrics = compute_low_dim_metrics(rng, ani_points, ani_hull, mres)
-                        results.append(
-                            {
-                                "dimension": dim,
-                                "n_points": n,
-                                "dataset": f"anisotropic_cond{cond}",
-                                "method": mres.method,
-                                **metrics,
-                            }
-                        )
-
-                for mres in method_outputs:
-                    if mres.status == "missing":
-                        continue
-                    metrics = compute_low_dim_metrics(rng, points, true_hull, mres)
-                    results.append(
-                        {
+                        key = (dim, n, dataset_name, mres.method)
+                        if key in existing_keys:
+                            continue
+                        metrics = compute_low_dim_metrics_safe(rng, points, mres.vertices)
+                        row = {
                             "dimension": dim,
                             "n_points": n,
                             "dataset": dataset_name,
                             "method": mres.method,
                             **metrics,
                         }
-                    )
+                        existing_keys.add(key)
+                        append_csv_rows(results_path, [row], fieldnames)
+                        log(f"    saved {mres.method} row to {results_path}")
 
-                # Store samples for visualisation
-                if dim in (2, 3) and (dim not in plot_samples):
-                    approximations = {m.method: m.vertices for m in method_outputs if m.vertices.size}
-                    plot_samples[dim] = (points, true_hull, approximations)
+                if not skip_dataset:
+                    # Store samples for visualisation
+                    if dim in (2, 3) and (dim not in plot_samples):
+                        plot_samples[dim] = (points, true_hull, approximations)
 
-    ensure_dir(output_dir)
-    save_csv(
-        os.path.join(output_dir, "low_dim_results.csv"),
-        results,
-        fieldnames=[
-            "dimension",
-            "n_points",
-            "dataset",
-            "method",
+            for cond in [1, 10, 100]:
+                ani_dataset = f"anisotropic_cond{cond}"
+                missing_ani = [method for method in method_names if (dim, n, ani_dataset, method) not in existing_keys]
+                if resume and not missing_ani:
+                    log(f"[low] skip d={dim} n={n} dataset={ani_dataset} (already in {results_path})")
+                    continue
+                if not missing_ani:
+                    log(f"[low] skip d={dim} n={n} dataset={ani_dataset} (already computed)")
+                    continue
+                log(f"[low] start d={dim} n={n} dataset={ani_dataset}")
+                ani_points = generate_anisotropic_gaussian(rng, n, dim, condition=cond)
+                ani_hull = ConvexHull(ani_points)
+                for method_name in method_names:
+                    if method_name not in missing_ani:
+                        continue
+                    if method_name == "Extents":
+                        mres = run_and_log(
+                            "Extents",
+                            ani_points,
+                            {"random_samples": 2048},
+                            deephull_kwargs,
+                        )
+                    elif method_name == "MVEE":
+                        mres = run_and_log(
+                            "MVEE",
+                            ani_points,
+                            {"m": 8, "kappa": 45},
+                            deephull_kwargs,
+                        )
+                    else:
+                        method = method_name.split("-", 1)[1]
+                        mres = run_and_log(method_name, ani_points, {}, deephull_kwargs)
+                    if mres.status == "missing":
+                        continue
+                    metrics = compute_low_dim_metrics_safe(rng, ani_points, mres.vertices)
+                    row = {
+                        "dimension": dim,
+                        "n_points": n,
+                        "dataset": ani_dataset,
+                        "method": mres.method,
+                        **metrics,
+                    }
+                    key = (dim, n, ani_dataset, mres.method)
+                    if key in existing_keys:
+                        continue
+                    existing_keys.add(key)
+                    append_csv_rows(results_path, [row], fieldnames)
+                    log(f"    saved {mres.method} row to {results_path}")
+
+    plot_rows = load_csv_rows(
+        results_path,
+        int_fields=["dimension", "n_points", "n_vertices"],
+        float_fields=[
             "support_error",
             "volume_ratio",
             "volume_true",
             "volume_approx",
             "membership_acc",
             "runtime_ms",
-            "n_vertices",
-            "status",
         ],
     )
-
-    plot_metric_vs_n(results, "support_error", "Support function error", "Support error vs n", output_dir)
-    plot_metric_vs_n(results, "volume_ratio", "Volume ratio (approx/true)", "Volume ratio vs n", output_dir)
-    plot_metric_vs_n(results, "runtime_ms", "Runtime (ms)", "Runtime vs n", output_dir, logy=True)
+    if not plot_rows:
+        log("[low] no results available; skipping plots")
+        return plot_rows
+    ensure_dir(output_dir)
+    plot_metric_vs_n(plot_rows, "support_error", "Support function error", "Support error vs n", output_dir)
+    plot_metric_vs_n(plot_rows, "volume_ratio", "Volume ratio (approx/true)", "Volume ratio vs n", output_dir)
+    plot_metric_vs_n(plot_rows, "runtime_ms", "Runtime (ms)", "Runtime vs n", output_dir, logy=True)
     for dim, payload in plot_samples.items():
         plot_low_dim_visualisations(*payload, output_path=os.path.join(output_dir, f"vis_d{dim}.png"))
-    return results
+    return plot_rows
 
 
 def run_high_dim_experiments(
     rng: np.random.Generator,
     output_dir: str,
     deephull_kwargs: Dict[str, Any],
+    resume: bool = False,
+    extents_samples: int = 2048,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     dims = [50, 100, 200, 500]
     ns = [2000, 5000, 10000]
-    runtime_rows: List[Dict[str, Any]] = []
-    support_rows: List[Dict[str, Any]] = []
-    feasibility: Dict[Tuple[str, int, int], bool] = {}
+    runtime_path = os.path.join(output_dir, "high_dim_runtime.csv")
+    support_path = os.path.join(output_dir, "high_dim_support_pairs.csv")
+    runtime_fieldnames = [
+        "dimension",
+        "n_points",
+        "dataset",
+        "method",
+        "runtime_ms",
+        "memory_bytes",
+        "status",
+        "qhull_status",
+    ]
+    support_fieldnames = ["dimension", "n_points", "dataset", "pair", "direction", "support_diff"]
+    runtime_rows_existing = (
+        load_csv_rows(
+            runtime_path,
+            int_fields=["dimension", "n_points"],
+            float_fields=["runtime_ms", "memory_bytes"],
+        )
+        if resume
+        else []
+    )
+    support_rows_existing = (
+        load_csv_rows(
+            support_path,
+            int_fields=["dimension", "n_points", "direction"],
+            float_fields=["support_diff"],
+        )
+        if resume
+        else []
+    )
+    if not resume:
+        ensure_dir(output_dir)
+        if os.path.exists(runtime_path):
+            with open(runtime_path, "w", encoding="utf-8"):
+                pass
+        if os.path.exists(support_path):
+            with open(support_path, "w", encoding="utf-8"):
+                pass
+    runtime_keys = (
+        build_key_set(runtime_rows_existing, ("dimension", "n_points", "dataset", "method")) if resume else set()
+    )
+    support_keys = (
+        build_key_set(support_rows_existing, ("dimension", "n_points", "dataset", "pair", "direction")) if resume else set()
+    )
+    method_names = ["Extents", "MVEE"]
+    if ConvexHullviaDeepHull is not None:
+        method_names.extend(["DeepHull-original", "DeepHull-convex"])
 
     for dim in dims:
         for n in ns:
             for dataset_name in ["gaussian", "uniform_cube"]:
+                expected_pairs = [
+                    f"{m1} vs {m2}" for m1, m2 in itertools.combinations(method_names, 2)
+                ]
+                runtime_missing = any(
+                    (dim, n, dataset_name, method) not in runtime_keys for method in method_names
+                )
+                support_missing = False
+                if expected_pairs:
+                    support_missing = any(
+                        (dim, n, dataset_name, pair, direction) not in support_keys
+                        for pair in expected_pairs
+                        for direction in range(256)
+                    )
+                if resume and not runtime_missing and not support_missing:
+                    log(f"[high] skip d={dim} n={n} dataset={dataset_name} (already in {output_dir})")
+                    continue
+
+                log(f"[high] start d={dim} n={n} dataset={dataset_name}")
                 points = DATASET_GENERATORS[dataset_name](rng, n, dim)
                 hull_result, status = try_exact_hull_with_timeout(points, timeout_s=5.0)
                 if status != "ok":
                     warnings.warn(f"SciPy hull skipped for d={dim}, n={n}, dataset={dataset_name}: {status}")
 
                 method_outputs: List[MethodResult] = []
-                method_outputs.append(run_extents(points, random_samples=4096))
-                method_outputs.append(run_mvee(points, m=8, kappa=45))
+                method_outputs.append(
+                    run_and_log(
+                        "Extents",
+                        points,
+                        {"random_samples": extents_samples},
+                        deephull_kwargs,
+                    )
+                )
+                method_outputs.append(
+                    run_and_log(
+                        "MVEE",
+                        points,
+                        {"m": 8, "kappa": 45},
+                        deephull_kwargs,
+                    )
+                )
                 for method in ["original", "convex"]:
-                    method_outputs.append(run_deephull(points, method=method, **deephull_kwargs))
+                    if f"DeepHull-{method}" in method_names:
+                        method_outputs.append(
+                            run_and_log(
+                                f"DeepHull-{method}",
+                                points,
+                                {},
+                                deephull_kwargs,
+                            )
+                        )
 
                 # Support function values for pairwise distances
                 dirs = sample_directions(rng, 256, dim)
                 support_by_method: Dict[str, np.ndarray] = {}
-
                 for mres in method_outputs:
-                    runtime_rows.append(
-                        {
-                            "dimension": dim,
-                            "n_points": n,
-                            "dataset": dataset_name,
-                            "method": mres.method,
-                            "runtime_ms": mres.runtime_ms,
-                            "memory_bytes": estimate_memory_bytes(mres.vertices),
-                            "status": mres.status,
-                            "qhull_status": status,
-                        }
-                    )
+                    row = {
+                        "dimension": dim,
+                        "n_points": n,
+                        "dataset": dataset_name,
+                        "method": mres.method,
+                        "runtime_ms": mres.runtime_ms,
+                        "memory_bytes": estimate_memory_bytes(mres.vertices),
+                        "status": mres.status,
+                        "qhull_status": status,
+                    }
+                    key = (dim, n, dataset_name, mres.method)
+                    if key not in runtime_keys:
+                        runtime_keys.add(key)
+                        append_csv_rows(runtime_path, [row], runtime_fieldnames)
+                        log(f"    saved {mres.method} row to {runtime_path}")
                     if mres.status == "missing":
                         continue
                     support_vals = support_function(mres.vertices, dirs)
                     support_by_method[mres.method] = support_vals
-                    feasibility[(mres.method, dim, n)] = mres.runtime_ms < 60000.0
 
-                support_rows.extend(
-                    [
-                        {
-                            "dimension": dim,
-                            "n_points": n,
-                            "dataset": dataset_name,
-                            **row,
-                        }
-                        for row in pairwise_support_distribution(dirs, support_by_method)
-                    ]
-                )
+                support_rows_to_append: List[Dict[str, Any]] = []
+                for row in pairwise_support_distribution(dirs, support_by_method):
+                    entry = {
+                        "dimension": dim,
+                        "n_points": n,
+                        "dataset": dataset_name,
+                        **row,
+                    }
+                    key = (dim, n, dataset_name, entry["pair"], entry["direction"])
+                    if key in support_keys:
+                        continue
+                    support_keys.add(key)
+                    support_rows_to_append.append(entry)
+                if support_rows_to_append:
+                    append_csv_rows(support_path, support_rows_to_append, support_fieldnames)
+                    log(f"[high] appended {len(support_rows_to_append)} rows to {support_path}")
 
+    plot_runtime_rows = load_csv_rows(
+        runtime_path,
+        int_fields=["dimension", "n_points"],
+        float_fields=["runtime_ms", "memory_bytes"],
+    )
+    plot_support_rows = load_csv_rows(
+        support_path,
+        int_fields=["dimension", "n_points", "direction"],
+        float_fields=["support_diff"],
+    )
+    if not plot_runtime_rows:
+        log("[high] no results available; skipping plots")
+        return plot_runtime_rows, plot_support_rows
+    feasibility: Dict[Tuple[str, int, int], bool] = {}
+    for row in plot_runtime_rows:
+        runtime = row.get("runtime_ms")
+        if runtime is None or not np.isfinite(runtime):
+            continue
+        feasibility[(str(row["method"]), int(row["dimension"]), int(row["n_points"]))] = float(runtime) < 60000.0
     ensure_dir(output_dir)
-    save_csv(
-        os.path.join(output_dir, "high_dim_runtime.csv"),
-        runtime_rows,
-        fieldnames=["dimension", "n_points", "dataset", "method", "runtime_ms", "memory_bytes", "status", "qhull_status"],
-    )
-    save_csv(
-        os.path.join(output_dir, "high_dim_support_pairs.csv"),
-        support_rows,
-        fieldnames=["dimension", "n_points", "dataset", "pair", "direction", "support_diff"],
-    )
 
-    plot_metric_vs_n(runtime_rows, "runtime_ms", "Runtime (ms)", "Runtime vs n (high-d)", output_dir, logy=True)
-    plot_runtime_vs_dimension(runtime_rows, output_dir)
+    plot_metric_vs_n(plot_runtime_rows, "runtime_ms", "Runtime (ms)", "Runtime vs n (high-d)", output_dir, logy=True)
+    plot_runtime_vs_dimension(plot_runtime_rows, output_dir)
     plot_violin_support(
-        support_rows,
+        plot_support_rows,
         output_path=os.path.join(output_dir, "support_pair_violin.png"),
     )
     plot_feasibility_heatmap(
         feasibility,
         output_path=os.path.join(output_dir, "feasibility_heatmap.png"),
     )
-    return runtime_rows, support_rows
+    return plot_runtime_rows, plot_support_rows
 
 
 def run_anomaly_detection(
     rng: np.random.Generator,
     output_dir: str,
     deephull_kwargs: Dict[str, Any],
+    resume: bool = False,
 ) -> List[Dict[str, Any]]:
+    results_path = os.path.join(output_dir, "anomaly_detection.csv")
+    fieldnames = ["method", "auroc", "aupr", "runtime_ms", "n_vertices"]
+    rows = (
+        load_csv_rows(
+            results_path,
+            int_fields=["n_vertices"],
+            float_fields=["auroc", "aupr", "runtime_ms"],
+        )
+        if resume
+        else []
+    )
+    if not resume:
+        ensure_dir(output_dir)
+        if os.path.exists(results_path):
+            with open(results_path, "w", encoding="utf-8"):
+                pass
+    existing_methods = {row["method"] for row in rows} if resume else set()
+    method_names = ["Extents", "MVEE"]
+    if ConvexHullviaDeepHull is not None:
+        method_names.extend(["DeepHull-original", "DeepHull-convex"])
+    plots_ready = all(
+        os.path.exists(os.path.join(output_dir, fname))
+        for fname in ["roc_curves.png", "pr_curves.png", "anomaly_bar.png"]
+    )
+    if resume and set(method_names).issubset(existing_methods) and plots_ready:
+        log(f"[anomaly] skip (already in {results_path})")
+        return rows
+
     n_train = 10000
     n_ood = 5000
     dim = 10
@@ -845,10 +1277,33 @@ def run_anomaly_detection(
     labels = np.concatenate([np.zeros(n_train, dtype=int), np.ones(n_ood, dtype=int)])
 
     method_outputs: List[MethodResult] = []
-    method_outputs.append(run_extents(train_points, random_samples=4096))
-    method_outputs.append(run_mvee(train_points, m=8, kappa=45))
+    log("[anomaly] start")
+    method_outputs.append(
+        run_and_log(
+            "Extents",
+            train_points,
+            {"random_samples": 4096},
+            deephull_kwargs,
+        )
+    )
+    method_outputs.append(
+        run_and_log(
+            "MVEE",
+            train_points,
+            {"m": 8, "kappa": 45},
+            deephull_kwargs,
+        )
+    )
     for method in ["original", "convex"]:
-        method_outputs.append(run_deephull(train_points, method=method, **deephull_kwargs))
+        if f"DeepHull-{method}" in method_names:
+            method_outputs.append(
+                run_and_log(
+                    f"DeepHull-{method}",
+                    train_points,
+                    {},
+                    deephull_kwargs,
+                )
+            )
 
     def score_points(vertices: np.ndarray, pts: np.ndarray) -> np.ndarray:
         if vertices.size == 0:
@@ -858,10 +1313,10 @@ def run_anomaly_detection(
         margins = support_vals - np.sum(directions * pts, axis=1)
         return -margins  # higher means more anomalous
 
-    rows: List[Dict[str, Any]] = []
     roc_curves: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     pr_curves: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
+    log("[anomaly] scoring methods")
     for mres in method_outputs:
         if mres.status == "missing":
             continue
@@ -873,22 +1328,21 @@ def run_anomaly_detection(
         recall, precision = _pr_curve(labels_np, scores)
         roc_curves[mres.method] = (fpr, tpr)
         pr_curves[mres.method] = (recall, precision)
-        rows.append(
-            {
-                "method": mres.method,
-                "auroc": auroc,
-                "aupr": aupr,
-                "runtime_ms": mres.runtime_ms,
-                "n_vertices": int(mres.vertices.shape[0]),
-            }
-        )
+        row = {
+            "method": mres.method,
+            "auroc": auroc,
+            "aupr": aupr,
+            "runtime_ms": mres.runtime_ms,
+            "n_vertices": int(mres.vertices.shape[0]),
+        }
+        if mres.method not in existing_methods:
+            existing_methods.add(mres.method)
+            rows.append(row)
+            append_csv_rows(results_path, [row], fieldnames)
+            log(f"    saved {mres.method} row to {results_path}")
+        log(f"  - {mres.method}: {mres.status} ({mres.runtime_ms:.1f} ms)")
 
     ensure_dir(output_dir)
-    save_csv(
-        os.path.join(output_dir, "anomaly_detection.csv"),
-        rows,
-        fieldnames=["method", "auroc", "aupr", "runtime_ms", "n_vertices"],
-    )
     plot_anomaly_curves(roc_curves, pr_curves, output_dir)
     metrics_dict = {row["method"]: (row["auroc"], row["aupr"]) for row in rows}
     plot_bar_metrics(metrics_dict, os.path.join(output_dir, "anomaly_bar.png"))
@@ -902,10 +1356,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run convex-hull experiments end-to-end.")
     parser.add_argument("--output-dir", type=str, default="outputs", help="Root directory for results and plots.")
     parser.add_argument("--seed", type=int, default=7, help="Base random seed.")
+    parser.add_argument(
+        "--high-extents-samples",
+        type=int,
+        default=2048,
+        help="Number of random directions for Extents in high-dimensional runs.",
+    )
     parser.add_argument("--deephull-epochs", type=int, default=150, help="Training epochs for DeepHull.")
     parser.add_argument("--deephull-lambda", type=float, default=2.0, help="Negative sample weight for DeepHull.")
     parser.add_argument("--deephull-epsilon", type=float, default=0.05, help="Boundary tolerance for DeepHull.")
     parser.add_argument("--deephull-lipschitz", type=float, default=1.0, help="Lipschitz constant for convex ICNN.")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing CSVs and append new rows.")
     return parser.parse_args()
 
 
@@ -918,21 +1379,28 @@ def main() -> None:
         "level_set_epsilon": args.deephull_epsilon,
         "lipschitz_constant": args.deephull_lipschitz,
     }
+    high_extents_samples = int(args.high_extents_samples)
 
     low_dir = os.path.join(args.output_dir, "low_dim")
     high_dir = os.path.join(args.output_dir, "high_dim")
     anomaly_dir = os.path.join(args.output_dir, "anomaly")
 
     print("[1/3] Running low-dimensional exact regime...")
-    low_results = run_low_dim_experiments(rng, low_dir, deephull_kwargs)
+    low_results = run_low_dim_experiments(rng, low_dir, deephull_kwargs, resume=args.resume)
     print(f"Saved low-dimensional results to {low_dir}")
 
     print("[2/3] Running high-dimensional scalability...")
-    high_runtime, high_support = run_high_dim_experiments(rng, high_dir, deephull_kwargs)
+    high_runtime, high_support = run_high_dim_experiments(
+        rng,
+        high_dir,
+        deephull_kwargs,
+        resume=args.resume,
+        extents_samples=high_extents_samples,
+    )
     print(f"Saved high-dimensional results to {high_dir}")
 
     print("[3/3] Running anomaly-detection benchmark...")
-    anomaly_results = run_anomaly_detection(rng, anomaly_dir, deephull_kwargs)
+    anomaly_results = run_anomaly_detection(rng, anomaly_dir, deephull_kwargs, resume=args.resume)
     print(f"Saved anomaly-detection results to {anomaly_dir}")
 
     # Aggregate index of produced files for convenience

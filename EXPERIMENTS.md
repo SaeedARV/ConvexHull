@@ -36,6 +36,42 @@ Use `--help` to see optional flags (seed, DeepHull hyperparameters, output direc
 - **High-dimensional scalability**: targets the methods’ intended use case—large d where exact hulls are infeasible. Runtime, memory, and feasibility probe whether each representation remains practical; pairwise support comparisons show relative geometric agreement when no ground truth exists.  
 - **Anomaly detection**: validates that hull quality transfers to a downstream task. Support-function margins are a natural scoring rule for all three solvers, so AUROC/AUPR illustrate how geometric differences affect end-user performance.
 
+## Metric definitions (CSV columns)
+
+### `low_dim/low_dim_results.csv`
+
+- `dimension`, `n_points`, `dataset`, `method`: identifiers for the run (dataset is `uniform_cube`, `gaussian`, or `anisotropic_cond{1,10,100}`; method is `Extents`, `MVEE`, `DeepHull-original`, `DeepHull-convex`).
+- `support_error`: max absolute support-function discrepancy over ~2000 random unit directions. Support is `h_K(u) = max_{x in K} u^T x`; lower is better.
+- `volume_ratio`: Monte Carlo estimate of `vol(approx) / vol(true)` using 5000 random samples in the true hull's bounding box; closer to 1 is better.
+- `volume_true`, `volume_approx`: the raw Monte Carlo volume estimates used to compute `volume_ratio`.
+- `membership_acc`: fraction of 5000 random samples in the bounding box where true and approximate hulls agree on inside/outside classification; closer to 1 is better.
+- `runtime_ms`: solver runtime for that method in milliseconds.
+- `n_vertices`: number of vertices in the method's returned hull representation.
+- `status`: `ok`, `empty` (insufficient vertices), or `missing` (method unavailable).
+
+### `high_dim/high_dim_runtime.csv`
+
+- `dimension`, `n_points`, `dataset`, `method`: identifiers for the run (dataset is `gaussian` or `uniform_cube`).
+- `runtime_ms`: solver runtime in milliseconds.
+- `memory_bytes`: `nbytes` of the vertex array returned (proxy for storage cost).
+- `status`: `ok`, `empty`, or `missing`.
+- `qhull_status`: status of the exact SciPy hull attempt (`ok`, `timeout`, `failed`).
+
+### `high_dim/high_dim_support_pairs.csv`
+
+- `dimension`, `n_points`, `dataset`: identifiers for the run.
+- `pair`: method pair (e.g., `Extents vs MVEE`).
+- `direction`: index of the random unit direction (0-255).
+- `support_diff`: absolute difference between the two methods' support-function values along that direction.
+
+### `anomaly/anomaly_detection.csv`
+
+- `method`: solver name.
+- `auroc`: area under the ROC curve for the anomaly score (higher is better).
+- `aupr`: area under the precision-recall curve for the anomaly score (higher is better).
+- `runtime_ms`: solver runtime in milliseconds.
+- `n_vertices`: number of vertices in the hull representation.
+
 ## What gets saved
 
 All artifacts live under the chosen `--output-dir` (default `outputs/`):
@@ -50,3 +86,25 @@ All artifacts live under the chosen `--output-dir` (default `outputs/`):
 - `manifest.json`: index of all generated files for convenience.
 
 If PyTorch or `ConvexHullviaDeepHull` is unavailable, the DeepHull rows/plots are skipped gracefully; Extents and MVEE still run.
+
+## Why each saved file matters for the paper
+
+### Low-dimensional exact regime
+
+- `low_dim/low_dim_results.csv`: the quantitative backbone for claims about geometric fidelity against ground truth. It captures accuracy (support error, volume ratio, membership) and efficiency (runtime, vertex count) so you can report tables, compute averages/variances, and run significance checks.
+- `low_dim/*.png`: visual and trend evidence for the narrative. Curves show how error/volume/runtime scale with n, and 2D/3D visualisations provide intuitive, inspectable examples that corroborate the numeric metrics.
+
+### High-dimensional scalability
+
+- `high_dim/high_dim_runtime.csv`: supports scalability claims when exact hulls are infeasible. Runtime and memory proxy costs show practical feasibility across d and n; the Qhull status indicates where exact baselines fail.
+- `high_dim/high_dim_support_pairs.csv`: provides a geometry-consistency signal when no ground truth exists. Pairwise support gaps quantify agreement or divergence between methods, enabling distributional comparisons beyond single summary statistics.
+- `high_dim/*.png`: translates the high-d results into paper-ready figures (runtime curves, feasibility heatmap, violin plots) that emphasize scaling behavior and method trade-offs.
+
+### Downstream anomaly detection
+
+- `anomaly/anomaly_detection.csv`: ties geometric quality to a downstream task. AUROC/AUPR measure detection performance, while runtime and vertex count show the cost of using each method.
+- `anomaly/*.png`: standard evaluation plots (ROC/PR) and summary bars that communicate method performance in a form expected by reviewers.
+
+### Experiment index
+
+- `manifest.json`: makes results auditable and reproducible by listing all generated artifacts, which is helpful when assembling figures or sharing outputs with collaborators.
