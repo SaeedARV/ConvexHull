@@ -28,7 +28,6 @@ import os
 import time
 import warnings
 import gc
-import multiprocessing
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -218,53 +217,12 @@ def _run_method_worker(
     raise ValueError(f"Unknown method name: {method_name}")
 
 
-def _run_method_worker_entry(
-    queue: multiprocessing.Queue,
-    method_name: str,
-    points: np.ndarray,
-    method_params: Dict[str, Any],
-    deephull_kwargs: Dict[str, Any],
-) -> None:
-    try:
-        result = _run_method_worker(method_name, points, method_params, deephull_kwargs)
-        queue.put(("ok", result))
-    except Exception as exc:
-        queue.put(("error", repr(exc)))
-
-
-def run_method_in_subprocess(
-    method_name: str,
-    points: np.ndarray,
-    method_params: Dict[str, Any],
-    deephull_kwargs: Dict[str, Any],
-) -> MethodResult:
-    ctx = multiprocessing.get_context("spawn")
-    queue: multiprocessing.Queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_run_method_worker_entry,
-        args=(queue, method_name, points, method_params, deephull_kwargs),
-    )
-    proc.start()
-    proc.join()
-    if not queue.empty():
-        status, payload = queue.get()
-        if status == "ok":
-            return payload
-        log(f"  - {method_name}: error {payload}")
-    if proc.exitcode not in (None, 0):
-        log(f"  - {method_name}: subprocess exited with code {proc.exitcode}")
-    return MethodResult(method_name, np.empty((0, points.shape[1])), [], 0.0, status="error")
-
-
 def run_method(
     method_name: str,
     points: np.ndarray,
     method_params: Dict[str, Any],
     deephull_kwargs: Dict[str, Any],
-    use_subprocess: bool = True,
 ) -> MethodResult:
-    if use_subprocess:
-        return run_method_in_subprocess(method_name, points, method_params, deephull_kwargs)
     return _run_method_worker(method_name, points, method_params, deephull_kwargs)
 
 
@@ -273,28 +231,12 @@ def run_and_log(
     points: np.ndarray,
     method_params: Dict[str, Any],
     deephull_kwargs: Dict[str, Any],
-    use_subprocess: bool = True,
 ) -> MethodResult:
     log(f"  - {method_name}: starting")
-    result = run_method(method_name, points, method_params, deephull_kwargs, use_subprocess=use_subprocess)
+    result = run_method(method_name, points, method_params, deephull_kwargs)
     log(f"  - {method_name}: finished ({result.status}, {result.runtime_ms:.1f} ms)")
     cleanup_after_method()
     return result
-
-
-def _metrics_worker_entry(
-    queue: multiprocessing.Queue,
-    seed: int,
-    points: np.ndarray,
-    vertices: np.ndarray,
-) -> None:
-    try:
-        rng = np.random.default_rng(seed)
-        true_hull = ConvexHull(points)
-        metrics = compute_low_dim_metrics(rng, points, true_hull, MethodResult("tmp", vertices, [], 0.0))
-        queue.put(("ok", metrics))
-    except Exception as exc:
-        queue.put(("error", repr(exc)))
 
 
 def compute_low_dim_metrics_safe(
@@ -302,32 +244,23 @@ def compute_low_dim_metrics_safe(
     points: np.ndarray,
     vertices: np.ndarray,
 ) -> Dict[str, Any]:
-    seed = int(rng.integers(0, 2**31 - 1))
-    ctx = multiprocessing.get_context("spawn")
-    queue: multiprocessing.Queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_metrics_worker_entry,
-        args=(queue, seed, points, vertices),
-    )
-    proc.start()
-    proc.join()
-    if not queue.empty():
-        status, payload = queue.get()
-        if status == "ok":
-            return payload
-        log(f"  - metrics error {payload}")
-    if proc.exitcode not in (None, 0):
-        log(f"  - metrics subprocess exited with code {proc.exitcode}")
-    return {
-        "support_error": math.nan,
-        "volume_ratio": math.nan,
-        "volume_true": math.nan,
-        "volume_approx": math.nan,
-        "membership_acc": math.nan,
-        "runtime_ms": math.nan,
-        "n_vertices": int(vertices.shape[0]),
-        "status": "metric_error",
-    }
+    try:
+        seed = int(rng.integers(0, 2**31 - 1))
+        local_rng = np.random.default_rng(seed)
+        true_hull = ConvexHull(points)
+        return compute_low_dim_metrics(local_rng, points, true_hull, MethodResult("tmp", vertices, [], 0.0))
+    except Exception as exc:
+        log(f"  - metrics error {exc!r}")
+        return {
+            "support_error": math.nan,
+            "volume_ratio": math.nan,
+            "volume_true": math.nan,
+            "volume_approx": math.nan,
+            "membership_acc": math.nan,
+            "runtime_ms": math.nan,
+            "n_vertices": int(vertices.shape[0]),
+            "status": "metric_error",
+        }
 
 
 def cleanup_after_method() -> None:
