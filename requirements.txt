@@ -1,6 +1,7 @@
 cvxpy
 matplotlib
 numpy
+numba
 scipy
 shapely
 torch

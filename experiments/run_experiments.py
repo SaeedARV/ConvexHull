@@ -30,7 +30,6 @@ import warnings
 import gc
 import multiprocessing
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -42,7 +41,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.spatial import ConvexHull, QhullError  # noqa: E402
 
-from ConvexHullviaExtents import ConvexHullviaExtents  # noqa: E402
+from extents.convexhull import ConvexHullviaExtents  # noqa: E402
 from ConvexHullviaMVEE import ConvexHullviaMVEE  # noqa: E402
 
 try:
@@ -214,7 +213,8 @@ def _run_method_worker(
         return run_mvee(points, **method_params)
     if method_name.startswith("DeepHull-"):
         method = method_name.split("-", 1)[1]
-        return run_deephull(points, method=method, **deephull_kwargs)
+        order_indices = method_params.get("order_indices", True)
+        return run_deephull(points, method=method, order_indices=order_indices, **deephull_kwargs)
     raise ValueError(f"Unknown method name: {method_name}")
 
 
@@ -475,48 +475,36 @@ def estimate_memory_bytes(vertices: np.ndarray) -> int:
     return int(vertices.nbytes)
 
 
-def _convex_hull_worker(arr: np.ndarray) -> Optional[ConvexHull]:
-    try:
-        return ConvexHull(arr)
-    except Exception:
-        return None
-
-
-def try_exact_hull_with_timeout(points: np.ndarray, timeout_s: float = 5.0) -> Tuple[Optional[ConvexHull], str]:
-    """
-    Attempt to compute an exact hull in a subprocess to avoid hard hangs.
-    Returns (hull | None, status).
-    """
-    with ProcessPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(_convex_hull_worker, points)
-        try:
-            hull = fut.result(timeout=timeout_s)
-        except TimeoutError:
-            return None, "timeout"
-    return hull, "ok" if hull is not None else "failed"
-
-
 # ---------------------------------------------------------------------------
 # Solver wrappers
 # ---------------------------------------------------------------------------
-def run_extents(points: np.ndarray, random_samples: int = 2048) -> MethodResult:
+def run_extents(
+    points: np.ndarray,
+    random_samples: int = 2048,
+    order_indices: bool = True,
+) -> MethodResult:
     start = time.perf_counter()
     solver = ConvexHullviaExtents(points)
-    _, approx_set = solver.get_random_extents(random_samples, return_approx_hull=True)
+    _, approx_set = solver.get_random_extents(
+        random_samples,
+        return_approx_hull=True,
+        method="auto",
+    )
     runtime_ms = (time.perf_counter() - start) * 1000.0
     if not approx_set:
         return MethodResult("Extents", np.empty((0, points.shape[1])), [], runtime_ms, status="empty")
     approx_vertices = np.array(list(approx_set))
     try:
         indices = _points_to_indices(points, approx_vertices)
-        indices = _order_indices(points, indices)
+        if order_indices:
+            indices = _order_indices(points, indices)
     except Exception as exc:  # pragma: no cover - defensive
         warnings.warn(f"Extents index mapping failed: {exc}")
         indices = []
     return MethodResult("Extents", approx_vertices, indices, runtime_ms)
 
 
-def run_mvee(points: np.ndarray, **kwargs: Any) -> MethodResult:
+def run_mvee(points: np.ndarray, order_indices: bool = True, **kwargs: Any) -> MethodResult:
     start = time.perf_counter()
     solver = ConvexHullviaMVEE(points)
     result = solver.compute(return_extents=True, **kwargs)
@@ -527,14 +515,20 @@ def run_mvee(points: np.ndarray, **kwargs: Any) -> MethodResult:
     approx_vertices = np.asarray(approx)
     try:
         indices = _points_to_indices(points, approx_vertices)
-        indices = _order_indices(points, indices)
+        if order_indices:
+            indices = _order_indices(points, indices)
     except Exception as exc:  # pragma: no cover - defensive
         warnings.warn(f"MVEE index mapping failed: {exc}")
         indices = []
     return MethodResult("MVEE", approx_vertices, indices, runtime_ms)
 
 
-def run_deephull(points: np.ndarray, method: str, **kwargs: Any) -> MethodResult:
+def run_deephull(
+    points: np.ndarray,
+    method: str,
+    order_indices: bool = True,
+    **kwargs: Any,
+) -> MethodResult:
     start = time.perf_counter()
     if ConvexHullviaDeepHull is None:
         return MethodResult(f"DeepHull-{method}", np.empty((0, points.shape[1])), [], 0.0, status="missing")
@@ -543,7 +537,8 @@ def run_deephull(points: np.ndarray, method: str, **kwargs: Any) -> MethodResult
     runtime_ms = (time.perf_counter() - start) * 1000.0
     approx_vertices = points[indices] if indices else np.empty((0, points.shape[1]))
     indices = _sanitize_indices(indices, points.shape[0])
-    indices = _order_indices(points, indices)
+    if order_indices:
+        indices = _order_indices(points, indices)
     return MethodResult(f"DeepHull-{method}", approx_vertices, indices, runtime_ms)
 
 
@@ -1062,7 +1057,6 @@ def run_high_dim_experiments(
         "runtime_ms",
         "memory_bytes",
         "status",
-        "qhull_status",
     ]
     support_fieldnames = ["dimension", "n_points", "dataset", "pair", "direction", "support_diff"]
     runtime_rows_existing = (
@@ -1123,16 +1117,13 @@ def run_high_dim_experiments(
 
                 log(f"[high] start d={dim} n={n} dataset={dataset_name}")
                 points = DATASET_GENERATORS[dataset_name](rng, n, dim)
-                hull_result, status = try_exact_hull_with_timeout(points, timeout_s=5.0)
-                if status != "ok":
-                    warnings.warn(f"SciPy hull skipped for d={dim}, n={n}, dataset={dataset_name}: {status}")
 
                 method_outputs: List[MethodResult] = []
                 method_outputs.append(
                     run_and_log(
                         "Extents",
                         points,
-                        {"random_samples": extents_samples},
+                        {"random_samples": extents_samples, "order_indices": False},
                         deephull_kwargs,
                     )
                 )
@@ -1140,7 +1131,7 @@ def run_high_dim_experiments(
                     run_and_log(
                         "MVEE",
                         points,
-                        {"m": 8, "kappa": 45},
+                        {"m": 8, "kappa": 45, "order_indices": False},
                         deephull_kwargs,
                     )
                 )
@@ -1150,7 +1141,7 @@ def run_high_dim_experiments(
                             run_and_log(
                                 f"DeepHull-{method}",
                                 points,
-                                {},
+                                {"order_indices": False},
                                 deephull_kwargs,
                             )
                         )
@@ -1167,7 +1158,6 @@ def run_high_dim_experiments(
                         "runtime_ms": mres.runtime_ms,
                         "memory_bytes": estimate_memory_bytes(mres.vertices),
                         "status": mres.status,
-                        "qhull_status": status,
                     }
                     key = (dim, n, dataset_name, mres.method)
                     if key not in runtime_keys:
@@ -1357,6 +1347,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="outputs", help="Root directory for results and plots.")
     parser.add_argument("--seed", type=int, default=7, help="Base random seed.")
     parser.add_argument(
+        "--steps",
+        type=str,
+        default="low,high,anomaly",
+        help="Comma-separated list of steps to run: low, high, anomaly.",
+    )
+    parser.add_argument(
         "--high-extents-samples",
         type=int,
         default=2048,
@@ -1372,6 +1368,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    steps = {step.strip().lower() for step in args.steps.split(",") if step.strip()}
+    valid_steps = {"low", "high", "anomaly"}
+    unknown = steps - valid_steps
+    if unknown:
+        raise ValueError(f"Unknown steps: {', '.join(sorted(unknown))}. Use low, high, anomaly.")
+    if not steps:
+        raise ValueError("No steps selected. Use --steps low,high,anomaly (or a subset).")
+
     rng = np.random.default_rng(args.seed)
     deephull_kwargs = {
         "max_epochs": args.deephull_epochs,
@@ -1385,29 +1389,37 @@ def main() -> None:
     high_dir = os.path.join(args.output_dir, "high_dim")
     anomaly_dir = os.path.join(args.output_dir, "anomaly")
 
-    print("[1/3] Running low-dimensional exact regime...")
-    low_results = run_low_dim_experiments(rng, low_dir, deephull_kwargs, resume=args.resume)
-    print(f"Saved low-dimensional results to {low_dir}")
+    if "low" in steps:
+        print("[low] Running low-dimensional exact regime...")
+        low_results = run_low_dim_experiments(rng, low_dir, deephull_kwargs, resume=args.resume)
+        print(f"Saved low-dimensional results to {low_dir}")
 
-    print("[2/3] Running high-dimensional scalability...")
-    high_runtime, high_support = run_high_dim_experiments(
-        rng,
-        high_dir,
-        deephull_kwargs,
-        resume=args.resume,
-        extents_samples=high_extents_samples,
-    )
-    print(f"Saved high-dimensional results to {high_dir}")
+    if "high" in steps:
+        print("[high] Running high-dimensional scalability...")
+        high_runtime, high_support = run_high_dim_experiments(
+            rng,
+            high_dir,
+            deephull_kwargs,
+            resume=args.resume,
+            extents_samples=high_extents_samples,
+        )
+        print(f"Saved high-dimensional results to {high_dir}")
 
-    print("[3/3] Running anomaly-detection benchmark...")
-    anomaly_results = run_anomaly_detection(rng, anomaly_dir, deephull_kwargs, resume=args.resume)
-    print(f"Saved anomaly-detection results to {anomaly_dir}")
+    if "anomaly" in steps:
+        print("[anomaly] Running anomaly-detection benchmark...")
+        anomaly_results = run_anomaly_detection(rng, anomaly_dir, deephull_kwargs, resume=args.resume)
+        print(f"Saved anomaly-detection results to {anomaly_dir}")
+
+    def list_dir(path: str) -> List[str]:
+        if not os.path.isdir(path):
+            return []
+        return [os.path.join(path, fname) for fname in os.listdir(path)]
 
     # Aggregate index of produced files for convenience
     manifest = {
-        "low_dim": [os.path.join(low_dir, fname) for fname in os.listdir(low_dir)],
-        "high_dim": [os.path.join(high_dir, fname) for fname in os.listdir(high_dir)],
-        "anomaly": [os.path.join(anomaly_dir, fname) for fname in os.listdir(anomaly_dir)],
+        "low_dim": list_dir(low_dir),
+        "high_dim": list_dir(high_dir),
+        "anomaly": list_dir(anomaly_dir),
     }
     save_json(os.path.join(args.output_dir, "manifest.json"), manifest)
     print(f"Experiment manifest written to {os.path.join(args.output_dir, 'manifest.json')}")

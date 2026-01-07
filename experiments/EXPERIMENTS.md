@@ -1,12 +1,26 @@
 # Experiment Guide
 
-This repository ships a single script, `run_experiments.py`, that runs all convex-hull experiments end-to-end. The script uses the provided solvers (`ConvexHullviaExtents`, `ConvexHullviaMVEE`, `ConvexHullviaDeepHull`) and saves numeric outputs plus publication-style plots. You can run everything with:
+This repository ships a single script, `experiments/run_experiments.py`, that runs all convex-hull experiments end-to-end. The script uses the provided solvers (`ConvexHullviaExtents`, `ConvexHullviaMVEE`, `ConvexHullviaDeepHull`) and saves numeric outputs plus publication-style plots. You can run everything with:
 
 ```bash
-python run_experiments.py --output-dir outputs
+python experiments/run_experiments.py --output-dir outputs
 ```
 
-Use `--help` to see optional flags (seed, DeepHull hyperparameters, output directory).
+If you run from the `experiments/` directory instead, use `--output-dir ../outputs`.
+
+Use `--help` to see optional flags (seed, DeepHull hyperparameters, output directory, steps).
+
+## Command-line arguments
+
+- `--output-dir` (default: `outputs`): root directory for results and plots.
+- `--seed` (default: `7`): base random seed for all experiments.
+- `--steps` (default: `low,high,anomaly`): comma-separated list of stages to run.
+- `--high-extents-samples` (default: `2048`): number of random directions for Extents in high-dimensional runs.
+- `--deephull-epochs` (default: `150`): training epochs for DeepHull.
+- `--deephull-lambda` (default: `2.0`): negative sample weight for DeepHull.
+- `--deephull-epsilon` (default: `0.05`): boundary tolerance for DeepHull.
+- `--deephull-lipschitz` (default: `1.0`): Lipschitz constant for convex ICNN.
+- `--resume`: resume from existing CSVs and append new rows.
 
 ## What the script does
 
@@ -20,8 +34,8 @@ Use `--help` to see optional flags (seed, DeepHull hyperparameters, output direc
 
 2) **High-dimensional scalability (d ∈ {50, 100, 200, 500}, n ∈ {2000, 5000, 10000})**  
    - Datasets: Gaussian and uniform cube.  
-   - Exact Qhull is attempted once with a short timeout and otherwise skipped.  
-   - Metrics per method: runtime, memory footprint of vertex sets, Qhull feasibility flag. Pairwise support-function discrepancies are collected across random directions.  
+   - Exact Qhull is skipped (it is infeasible at these dimensions).  
+   - Metrics per method: runtime and memory footprint of vertex sets. Pairwise support-function discrepancies are collected across random directions.  
    - Plots: runtime vs n (per dimension), runtime vs dimension (per n), feasibility heatmap (finish within 60s), and violin plots of pairwise support distances.
 
 3) **Downstream anomaly detection (OOD)**  
@@ -55,7 +69,6 @@ Use `--help` to see optional flags (seed, DeepHull hyperparameters, output direc
 - `runtime_ms`: solver runtime in milliseconds.
 - `memory_bytes`: `nbytes` of the vertex array returned (proxy for storage cost).
 - `status`: `ok`, `empty`, or `missing`.
-- `qhull_status`: status of the exact SciPy hull attempt (`ok`, `timeout`, `failed`).
 
 ### `high_dim/high_dim_support_pairs.csv`
 
@@ -96,7 +109,7 @@ If PyTorch or `ConvexHullviaDeepHull` is unavailable, the DeepHull rows/plots ar
 
 ### High-dimensional scalability
 
-- `high_dim/high_dim_runtime.csv`: supports scalability claims when exact hulls are infeasible. Runtime and memory proxy costs show practical feasibility across d and n; the Qhull status indicates where exact baselines fail.
+- `high_dim/high_dim_runtime.csv`: supports scalability claims when exact hulls are infeasible. Runtime and memory proxy costs show practical feasibility across d and n.
 - `high_dim/high_dim_support_pairs.csv`: provides a geometry-consistency signal when no ground truth exists. Pairwise support gaps quantify agreement or divergence between methods, enabling distributional comparisons beyond single summary statistics.
 - `high_dim/*.png`: translates the high-d results into paper-ready figures (runtime curves, feasibility heatmap, violin plots) that emphasize scaling behavior and method trade-offs.
 

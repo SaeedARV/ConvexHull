@@ -73,6 +73,27 @@ class ConvexHullviaExtents:
         self.points = np.array(points, dtype=np.float64)
         self.X = np.array(points, dtype=np.float64)
         self.extents, self.random_extents, self.extents_max = None, None, None
+        self._last_backend_log = None
+
+    def _log_backend(self, mode: str, requested: str, backend: str) -> None:
+        key = (mode, requested, backend)
+        if key == self._last_backend_log:
+            return
+        extra = ""
+        if backend == "numba" and _HAS_NUMBA:
+            try:
+                import numba as _numba  # type: ignore
+
+                threads = _numba.get_num_threads()
+                layer = _numba.threading_layer()
+                extra = f", threads={threads}, layer={layer}"
+            except Exception:
+                extra = ""
+        print(
+            f"[extents] mode={mode} backend={backend} (requested={requested}){extra}",
+            flush=True,
+        )
+        self._last_backend_log = key
 
     # ---------- Backend selection helpers ---------- #
 
@@ -191,6 +212,7 @@ class ConvexHullviaExtents:
         """
         n, d = self.X.shape
         backend = self._select_backend(method)
+        self._log_backend("deterministic", method, backend)
 
         directions = self._compute_directions(d, t)
 
@@ -274,6 +296,7 @@ class ConvexHullviaExtents:
         """
         n, d = self.X.shape
         backend = self._select_backend(method)
+        self._log_backend("random", method, backend)
 
         # Random directions (unit vectors)
         random_directions = np.random.normal(size=(t, d))
