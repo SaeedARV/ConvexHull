@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+.uv-cache
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+experiments/outputs
+
+*.ipynb
+

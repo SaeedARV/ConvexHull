@@ -2,6 +2,24 @@
 Fast and scalable randomized approximation algorithms for convex hulls, plus a
 deep learning baseline.
 
+## Run experiments via Docker
+
+Build:
+
+```bash
+docker build -t convexhull-experiments .
+```
+
+Run and write results to your local `outputs/` directory:
+
+```bash
+mkdir -p experiments/outputs
+docker run --rm \
+  --user "$(id -u)":"$(id -g)" \
+  -v "$(pwd)/experiments/outputs:/app/experiments/outputs" \
+  convexhull-experiments
+```
+
 ## Available solvers
 - `ConvexHullviaExtents` — deterministic sampling of directional extents (supports any dimension).
 - `ConvexHullviaMVEE` — MVEE-based approximation.
