@@ -20,6 +20,8 @@ Use `--help` to see optional flags (seed, DeepHull hyperparameters, output direc
 - `--deephull-lambda` (default: `2.0`): negative sample weight for DeepHull.
 - `--deephull-epsilon` (default: `0.05`): boundary tolerance for DeepHull.
 - `--deephull-lipschitz` (default: `1.0`): Lipschitz constant for convex ICNN.
+- `--log-file` (default: `output-dir/run_experiments_YYYYmmdd_HHMMSS.txt`): write progress logs to this file.
+- `--no-console-log`: disable console logging (log file still written).
 - `--resume`: resume from existing CSVs and append new rows.
 
 ## What the script does

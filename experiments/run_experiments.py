@@ -23,14 +23,23 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import logging
 import math
 import os
+from pathlib import Path
+import sys
 import time
 import warnings
 import gc
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+# Ensure local package imports (e.g., `extents`) work when running this script
+# directly from the repository root (or any working directory).
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import matplotlib
 
@@ -49,6 +58,10 @@ try:
 except ModuleNotFoundError:
     ConvexHullviaDeepHull = None  # type: ignore[assignment]
     warnings.warn("ConvexHullviaDeepHull is unavailable; DeepHull runs will be skipped.", RuntimeWarning)
+
+_LOGGER = logging.getLogger("run_experiments")
+_LOGGER.addHandler(logging.NullHandler())
+_LOG_PATH: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +210,63 @@ def build_key_set(rows: List[Dict[str, Any]], key_fields: Sequence[str]) -> set[
 
 
 def log(message: str) -> None:
+    # Centralized logging so runs can be audited after-the-fact.
+    # This gets configured in main() once we know the output directory.
+    if _LOGGER.handlers and not isinstance(_LOGGER.handlers[0], logging.NullHandler):
+        _LOGGER.info(message)
+        return
     print(message, flush=True)
+
+
+def _default_log_path(output_dir: str) -> str:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(output_dir, f"run_experiments_{stamp}.txt")
+
+
+def setup_logging(output_dir: str, log_file: Optional[str], console: bool = True) -> str:
+    """
+    Configure logging to a txt file (and optionally the console).
+
+    Returns the resolved log file path.
+    """
+    global _LOG_PATH
+
+    os.makedirs(output_dir, exist_ok=True)
+    resolved = log_file or _default_log_path(output_dir)
+    if resolved.endswith(os.sep) or (os.path.exists(resolved) and os.path.isdir(resolved)):
+        resolved = os.path.join(resolved, os.path.basename(_default_log_path(output_dir)))
+    os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
+
+    logger = _LOGGER
+    logger.setLevel(logging.INFO)
+    # Replace handlers if main() is called multiple times (e.g. in notebooks).
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+    logger.propagate = False
+
+    formatter = logging.Formatter(fmt="%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    file_handler = logging.FileHandler(resolved, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    if console:
+        stream_handler = logging.StreamHandler(stream=sys.stdout)
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+    # Route warnings.warn(...) through the logger as well (after this point).
+    logging.captureWarnings(True)
+    warnings_logger = logging.getLogger("py.warnings")
+    # Attach the same handlers so warnings end up in the same txt log.
+    warnings_logger.handlers = list(logger.handlers)
+    warnings_logger.setLevel(logging.WARNING)
+    warnings_logger.propagate = False
+
+    _LOG_PATH = resolved
+    return resolved
 
 
 def _run_method_worker(
@@ -1296,11 +1365,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deephull-epsilon", type=float, default=0.05, help="Boundary tolerance for DeepHull.")
     parser.add_argument("--deephull-lipschitz", type=float, default=1.0, help="Lipschitz constant for convex ICNN.")
     parser.add_argument("--resume", action="store_true", help="Resume from existing CSVs and append new rows.")
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Write logs to this file (default: output-dir/run_experiments_YYYYmmdd_HHMMSS.txt).",
+    )
+    parser.add_argument(
+        "--no-console-log",
+        action="store_true",
+        help="Disable console logging (log file will still be written).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    log_path = setup_logging(args.output_dir, args.log_file, console=not args.no_console_log)
+    log(f"Logging to {log_path}")
     steps = {step.strip().lower() for step in args.steps.split(",") if step.strip()}
     valid_steps = {"low", "high", "anomaly"}
     unknown = steps - valid_steps
@@ -1323,12 +1405,12 @@ def main() -> None:
     anomaly_dir = os.path.join(args.output_dir, "anomaly")
 
     if "low" in steps:
-        print("[low] Running low-dimensional exact regime...")
+        log("[low] Running low-dimensional exact regime...")
         low_results = run_low_dim_experiments(rng, low_dir, deephull_kwargs, resume=args.resume)
-        print(f"Saved low-dimensional results to {low_dir}")
+        log(f"Saved low-dimensional results to {low_dir}")
 
     if "high" in steps:
-        print("[high] Running high-dimensional scalability...")
+        log("[high] Running high-dimensional scalability...")
         high_runtime, high_support = run_high_dim_experiments(
             rng,
             high_dir,
@@ -1336,12 +1418,12 @@ def main() -> None:
             resume=args.resume,
             extents_samples=high_extents_samples,
         )
-        print(f"Saved high-dimensional results to {high_dir}")
+        log(f"Saved high-dimensional results to {high_dir}")
 
     if "anomaly" in steps:
-        print("[anomaly] Running anomaly-detection benchmark...")
+        log("[anomaly] Running anomaly-detection benchmark...")
         anomaly_results = run_anomaly_detection(rng, anomaly_dir, deephull_kwargs, resume=args.resume)
-        print(f"Saved anomaly-detection results to {anomaly_dir}")
+        log(f"Saved anomaly-detection results to {anomaly_dir}")
 
     def list_dir(path: str) -> List[str]:
         if not os.path.isdir(path):
@@ -1355,7 +1437,7 @@ def main() -> None:
         "anomaly": list_dir(anomaly_dir),
     }
     save_json(os.path.join(args.output_dir, "manifest.json"), manifest)
-    print(f"Experiment manifest written to {os.path.join(args.output_dir, 'manifest.json')}")
+    log(f"Experiment manifest written to {os.path.join(args.output_dir, 'manifest.json')}")
 
 
 if __name__ == "__main__":
