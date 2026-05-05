@@ -10,6 +10,34 @@ Build:
 docker build -t convexhull-experiments .
 ```
 
+You may configure a Docker registry mirror on the server for pulling the base
+image, then pass separate Debian and PyPI mirrors for `apt-get` and `pip`:
+
+```bash
+docker build -t convexhull-experiments \
+  --build-arg APT_DEBIAN_MIRROR=https://mirror.example.ir/debian \
+  --build-arg APT_SECURITY_MIRROR=https://mirror.example.ir/debian-security \
+  --build-arg PIP_INDEX_URL=https://pypi.example.ir/simple \
+  .
+```
+
+For an HTTP PyPI mirror or a mirror with a certificate setup that pip does not
+trust, also pass its host name:
+
+```bash
+docker build -t convexhull-experiments \
+  --build-arg APT_DEBIAN_MIRROR=http://mirror.example.ir/debian \
+  --build-arg APT_SECURITY_MIRROR=http://mirror.example.ir/debian-security \
+  --build-arg PIP_INDEX_URL=http://pypi.example.ir/simple \
+  --build-arg PIP_TRUSTED_HOST=pypi.example.ir \
+  .
+```
+
+The Docker registry mirror only helps Docker pull images such as
+`python:3.11-slim-bookworm`; it does not mirror Debian `apt` packages or Python
+packages from PyPI. If you do not pass these build arguments, Docker uses the
+standard Debian and PyPI sources.
+
 Run and write results to your local `outputs/` directory:
 
 ```bash
