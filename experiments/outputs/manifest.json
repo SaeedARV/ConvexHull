@@ -1,0 +1,38 @@
+{
+  "low_dim": [
+    "experiments/outputs/low_dim/support_error_d8.png",
+    "experiments/outputs/low_dim/volume_ratio_d3.png",
+    "experiments/outputs/low_dim/runtime_ms_d2.png",
+    "experiments/outputs/low_dim/support_error_d3.png",
+    "experiments/outputs/low_dim/support_error_d2.png",
+    "experiments/outputs/low_dim/vis_d2.png",
+    "experiments/outputs/low_dim/volume_ratio_d5.png",
+    "experiments/outputs/low_dim/low_dim_results.csv",
+    "experiments/outputs/low_dim/runtime_ms_d5.png",
+    "experiments/outputs/low_dim/support_error_d5.png",
+    "experiments/outputs/low_dim/volume_ratio_d2.png",
+    "experiments/outputs/low_dim/volume_ratio_d8.png",
+    "experiments/outputs/low_dim/vis_d3.png",
+    "experiments/outputs/low_dim/runtime_ms_d8.png",
+    "experiments/outputs/low_dim/runtime_ms_d3.png"
+  ],
+  "high_dim": [
+    "experiments/outputs/high_dim/runtime_vs_dim_n10000.png",
+    "experiments/outputs/high_dim/runtime_ms_d200.png",
+    "experiments/outputs/high_dim/runtime_vs_dim_n5000.png",
+    "experiments/outputs/high_dim/runtime_ms_d500.png",
+    "experiments/outputs/high_dim/high_dim_runtime.csv",
+    "experiments/outputs/high_dim/high_dim_support_pairs.csv",
+    "experiments/outputs/high_dim/runtime_ms_d50.png",
+    "experiments/outputs/high_dim/feasibility_heatmap.png",
+    "experiments/outputs/high_dim/runtime_ms_d100.png",
+    "experiments/outputs/high_dim/support_pair_violin.png",
+    "experiments/outputs/high_dim/runtime_vs_dim_n2000.png"
+  ],
+  "anomaly": [
+    "experiments/outputs/anomaly/anomaly_detection.csv",
+    "experiments/outputs/anomaly/pr_curves.png",
+    "experiments/outputs/anomaly/anomaly_bar.png",
+    "experiments/outputs/anomaly/roc_curves.png"
+  ]
+}

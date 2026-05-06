@@ -801,6 +801,14 @@ def plot_low_dim_visualisations(
 # ---------------------------------------------------------------------------
 # Anomaly detection metrics (AUROC/AUPR without sklearn dependency)
 # ---------------------------------------------------------------------------
+def _trapezoid(y: np.ndarray, x: np.ndarray) -> float:
+    """Compatibility wrapper for NumPy versions with or without np.trapz."""
+    integrate = getattr(np, "trapezoid", None)
+    if integrate is None:
+        integrate = np.trapz
+    return float(integrate(y, x))
+
+
 def _binary_auc(labels: np.ndarray, scores: np.ndarray) -> float:
     """Computes AUROC with the trapezoidal rule."""
     order = np.argsort(scores)[::-1]
@@ -809,7 +817,7 @@ def _binary_auc(labels: np.ndarray, scores: np.ndarray) -> float:
     fps = np.cumsum(1 - labels_sorted)
     tpr = tps / (tps[-1] if tps[-1] > 0 else 1)
     fpr = fps / (fps[-1] if fps[-1] > 0 else 1)
-    return float(np.trapz(tpr, fpr))
+    return _trapezoid(tpr, fpr)
 
 
 def _precision_recall(labels: np.ndarray, scores: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -828,7 +836,7 @@ def _average_precision(labels: np.ndarray, scores: np.ndarray) -> float:
     # Ensure recall starts at 0 and ends at 1 for a proper integral
     recall_ext = np.concatenate([[0.0], recall, [1.0]])
     precision_ext = np.concatenate([[precision[0]], precision, [0.0]])
-    return float(np.trapz(precision_ext, recall_ext))
+    return _trapezoid(precision_ext, recall_ext)
 
 
 def _roc_curve(labels: np.ndarray, scores: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
