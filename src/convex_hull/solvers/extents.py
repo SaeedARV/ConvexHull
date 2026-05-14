@@ -1,5 +1,6 @@
 import numpy as np
-from common import normalize
+
+from convex_hull.utils import normalize
 
 # ---------------- Backend detection ---------------- #
 

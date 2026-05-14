@@ -1,10 +1,8 @@
 import numpy as np
-from common import (
-    vMF,
-    householder_matrix,
-)
-from Ellipsoid import Ellipsoid
-from common import sample_input
+
+from convex_hull.geometry import Ellipsoid
+from convex_hull.sampling import vMF
+from convex_hull.utils import householder_matrix, sample_input
 
 np.random.seed(41)
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
@@ -88,7 +86,7 @@ if __name__ == "__main__":
     Z = sample_input()
     conv = ConvexHullviaMVEE(Z)
     hull = conv.compute()
-    from plots import plots
+    from convex_hull.visualization import plots
     from scipy.spatial import ConvexHull
 
     plots(Z, ConvexHull(Z)).all(hull)

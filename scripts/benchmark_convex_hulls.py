@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -17,11 +19,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
 
-from ConvexHullviaExtents import ConvexHullviaExtents
-from ConvexHullviaMVEE import ConvexHullviaMVEE
+ROOT_DIR = Path(__file__).resolve().parent.parent
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from convex_hull import ConvexHullviaExtents, ConvexHullviaMVEE
 
 try:
-    from ConvexHullviaDeepHull import ConvexHullviaDeepHull
+    from convex_hull import ConvexHullviaDeepHull
 except ModuleNotFoundError:
     ConvexHullviaDeepHull = None  # type: ignore[assignment]
 

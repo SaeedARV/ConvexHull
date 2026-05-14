@@ -1,8 +1,16 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from scipy.spatial import ConvexHull
-from common import sample_input, householder_matrix
-from plots import plots
+import sys
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from convex_hull.utils import householder_matrix, sample_input
+from convex_hull.visualization import plots
 
 np.random.seed(41)
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})

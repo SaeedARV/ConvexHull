@@ -35,11 +35,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-# Ensure local package imports (e.g., `extents`) work when running this script
-# directly from the repository root (or any working directory).
+# Allow direct execution from a checkout without requiring editable install.
 ROOT_DIR = Path(__file__).resolve().parent.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 import matplotlib
 
@@ -49,11 +49,10 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.spatial import ConvexHull, QhullError  # noqa: E402
 
-from extents.convexhull import ConvexHullviaExtents  # noqa: E402
-from ConvexHullviaMVEE import ConvexHullviaMVEE  # noqa: E402
+from convex_hull import ConvexHullviaExtents, ConvexHullviaMVEE  # noqa: E402
 
 try:
-    from ConvexHullviaDeepHull import ConvexHullviaDeepHull  # type: ignore
+    from convex_hull import ConvexHullviaDeepHull  # type: ignore
     import torch  # type: ignore
 except ModuleNotFoundError:
     ConvexHullviaDeepHull = None  # type: ignore[assignment]

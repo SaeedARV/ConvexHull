@@ -2,6 +2,33 @@
 Fast and scalable randomized approximation algorithms for convex hulls, plus a
 deep learning baseline.
 
+## Install locally
+
+Install the package in editable mode before running scripts directly:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+For a `uv`-managed environment:
+
+```bash
+uv pip install -r requirements.txt
+uv pip install -e .
+```
+
+## Repository layout
+
+- `src/convex_hull/`: reusable package code.
+- `src/convex_hull/solvers/`: Extents, MVEE, and DeepHull implementations.
+- `src/convex_hull/geometry/`, `sampling/`, `utils/`, `visualization/`: shared support code.
+- `experiments/`: experiment runner, checked-in outputs, and small model artifacts.
+- `scripts/`: standalone benchmark/demo entrypoints.
+- `notebooks/`: exploratory notebooks.
+- `tests/`: import and solver smoke tests.
+- `paper/`: local paper sources, ignored by Git.
+
 ## Run experiments via Docker
 
 Build:
@@ -63,7 +90,7 @@ convex variant (`method="convex"`) via the `method` argument.
 
 ```python
 import numpy as np
-from ConvexHullviaDeepHull import ConvexHullviaDeepHull
+from convex_hull import ConvexHullviaDeepHull
 
 points = np.random.rand(30, 3)
 deephull = ConvexHullviaDeepHull(max_epochs=150, method="convex", lipschitz_constant=1.0)
@@ -73,12 +100,12 @@ approx_points = points[vertex_indices]
 
 ## Benchmarking the methods
 
-Use `benchmark_convex_hulls.py` to generate synthetic datasets (uniform, rotated
+Use `scripts/benchmark_convex_hulls.py` to generate synthetic datasets (uniform, rotated
 Gaussian, and annulus shells), run all solvers, and report accuracy/runtime
 metrics against SciPy’s exact hull:
 
 ```bash
-python3 benchmark_convex_hulls.py --datasets uniform,gaussian,annulus \
+python3 scripts/benchmark_convex_hulls.py --datasets uniform,gaussian,annulus \
     --samples 200 --min-points 50 --max-points 50 --dimension 5
 ```
 

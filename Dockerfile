@@ -41,6 +41,7 @@ RUN set -eux; \
     fi
 
 COPY . /app
+RUN python -m pip install --no-deps -e /app
 
 ENTRYPOINT ["python", "-m", "experiments.run_experiments"]
 CMD ["--output-dir", "experiments/outputs"]

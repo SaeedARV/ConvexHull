@@ -1,8 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from ConvexHullviaExtents import ConvexHullviaExtents
-from ConvexHullviaMVEE import ConvexHullviaMVEE
-from Ellipsoid import Ellipsoid
+from convex_hull import ConvexHullviaExtents, ConvexHullviaMVEE
+from convex_hull.geometry import Ellipsoid
 
 np.random.seed(41)
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})

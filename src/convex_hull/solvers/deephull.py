@@ -419,7 +419,7 @@ class ConvexHullviaDeepHull:
 
 
 if __name__ == "__main__":
-    from common import sample_input
+    from convex_hull.utils import sample_input
 
     data = sample_input()
     solver = ConvexHullviaDeepHull()
