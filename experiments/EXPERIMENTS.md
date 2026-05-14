@@ -1,6 +1,6 @@
 # Experiment Guide
 
-This repository ships a single script, `experiments/run_experiments.py`, that runs all convex-hull experiments end-to-end. The script uses the provided solvers (`ConvexHullviaExtents`, `ConvexHullviaMVEE`, `ConvexHullviaDeepHull`) and saves numeric outputs plus publication-style plots. You can run everything with:
+This repository ships a single script, `experiments/run_experiments.py`, that runs all convex-hull experiments end-to-end. The script uses the provided solvers (`ApproxConvexHull` through the Extents/MVEE wrappers, plus `ConvexHullviaDeepHull`) and saves numeric outputs plus publication-style plots. You can run everything with:
 
 ```bash
 python experiments/run_experiments.py --output-dir experiments/outputs

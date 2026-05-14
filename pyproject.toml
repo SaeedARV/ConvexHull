@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.11", "pybind11>=3.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "convex-hull-approx"
@@ -9,8 +9,12 @@ description = "Convex hull approximation solvers and experiments for research."
 requires-python = ">=3.11"
 readme = "README.md"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.scikit-build]
+wheel.packages = ["src/convex_hull"]
+minimum-version = "0.11"
+
+[tool.scikit-build.cmake]
+version = ">=3.18"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -486,17 +486,17 @@ def run_extents(
 ) -> MethodResult:
     start = time.perf_counter()
     solver = ConvexHullviaExtents(points)
-    _, approx_set = solver.get_random_extents(
+    indices = solver.compute_indices(
         random_samples,
-        return_approx_hull=True,
+        mode="random",
         method="auto",
     )
     runtime_ms = (time.perf_counter() - start) * 1000.0
-    if not approx_set:
+    if indices.size == 0:
         return MethodResult("Extents", np.empty((0, points.shape[1])), [], runtime_ms, status="empty")
-    approx_vertices = np.array(list(approx_set))
+    indices = [int(idx) for idx in indices]
+    approx_vertices = points[indices]
     try:
-        indices = _points_to_indices(points, approx_vertices)
         if order_indices:
             indices = _order_indices(points, indices)
     except Exception as exc:  # pragma: no cover - defensive
@@ -508,14 +508,13 @@ def run_extents(
 def run_mvee(points: np.ndarray, order_indices: bool = True, **kwargs: Any) -> MethodResult:
     start = time.perf_counter()
     solver = ConvexHullviaMVEE(points)
-    result = solver.compute(return_extents=True, **kwargs)
-    approx = result[0] if isinstance(result, tuple) else result
+    indices = solver.compute_indices(**kwargs)
     runtime_ms = (time.perf_counter() - start) * 1000.0
-    if approx.shape[0] < 3:
+    if indices.size < 3:
         return MethodResult("MVEE", np.empty((0, points.shape[1])), [], runtime_ms, status="empty")
-    approx_vertices = np.asarray(approx)
+    indices = [int(idx) for idx in indices]
+    approx_vertices = points[indices]
     try:
-        indices = _points_to_indices(points, approx_vertices)
         if order_indices:
             indices = _order_indices(points, indices)
     except Exception as exc:  # pragma: no cover - defensive

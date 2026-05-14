@@ -17,7 +17,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Runtime libs for common scientific/python wheels (matplotlib Agg, numba, etc.)
+# Build/runtime libs for the optional C++ backend and scientific wheels.
 RUN set -eux; \
     sed -i \
         -e "s|http://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
@@ -25,9 +25,12 @@ RUN set -eux; \
         /etc/apt/sources.list.d/debian.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
         libfreetype6 \
+        libgomp1 \
         libpng16-16 \
-        libgomp1; \
+        ninja-build; \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt

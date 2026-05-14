@@ -140,23 +140,19 @@ def evaluate_prediction(points: np.ndarray, gt_hull: ConvexHull, candidate_indic
 
 def run_extents(points: np.ndarray, random_samples: int = 2048) -> List[int]:
     solver = ConvexHullviaExtents(points)
-    _, approx_set = solver.get_random_extents(random_samples, return_approx_hull=True)
-    if not approx_set:
+    indices = solver.compute_indices(random_samples, mode="random", method="auto")
+    if indices.size == 0:
         return []
-    approx_points = np.array(list(approx_set))
-    approx_indices = _points_to_indices(points, approx_points)
-    ordered = _order_indices(points, approx_indices)
+    ordered = _order_indices(points, [int(idx) for idx in indices])
     return ordered
 
 
 def run_mvee(points: np.ndarray, **kwargs) -> List[int]:
     solver = ConvexHullviaMVEE(points)
-    result = solver.compute(return_extents=True, **kwargs)
-    approx = result[0] if isinstance(result, tuple) else result
-    if approx.shape[0] < 3:
+    indices = solver.compute_indices(**kwargs)
+    if indices.size < 3:
         return []
-    approx_indices = _points_to_indices(points, approx)
-    ordered = _order_indices(points, approx_indices)
+    ordered = _order_indices(points, [int(idx) for idx in indices])
     return ordered
 
 

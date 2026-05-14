@@ -2,18 +2,12 @@
 
 import numpy as np
 
+from convex_hull.approximation._sampling import householder_matrix, householder_vector
+
 
 def normalize(v):
     """Normalize a vector to unit length."""
-    return v / np.linalg.norm(v)
-
-
-def householder_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """
-    Compute the Householder reflection H such that H @ a = b.
-
-    Parameters are assumed to be unit vectors in R^d.
-    """
-    v = a - b
-    v = v / np.linalg.norm(v)
-    return np.eye(a.shape[0]) - 2.0 * np.outer(v, v)
+    norm = np.linalg.norm(v)
+    if norm == 0.0:
+        return np.asarray(v, dtype=float)
+    return np.asarray(v, dtype=float) / norm

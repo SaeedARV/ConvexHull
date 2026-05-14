@@ -21,7 +21,8 @@ uv pip install -e .
 ## Repository layout
 
 - `src/convex_hull/`: reusable package code.
-- `src/convex_hull/solvers/`: Extents, MVEE, and DeepHull implementations.
+- `src/convex_hull/approximation/`: shared ApproxConvexHull core with Python, Numba, and C++ backends.
+- `src/convex_hull/solvers/`: compatibility wrappers for Extents/MVEE plus DeepHull.
 - `src/convex_hull/geometry/`, `sampling/`, `utils/`, `visualization/`: shared support code.
 - `experiments/`: experiment runner, checked-in outputs, and small model artifacts.
 - `scripts/`: standalone benchmark/demo entrypoints.
@@ -76,10 +77,25 @@ docker run --rm \
 ```
 
 ## Available solvers
-- `ConvexHullviaExtents` — deterministic sampling of directional extents (supports any dimension).
-- `ConvexHullviaMVEE` — MVEE-based approximation.
+- `ApproxConvexHull` — preferred API for uniform and MVEE-guided approximate hulls.
+- `ConvexHullviaExtents` — compatibility wrapper for uniform directional sampling.
+- `ConvexHullviaMVEE` — compatibility wrapper for MVEE-guided vMF sampling.
 - `ConvexHullviaDeepHull` — DeepHull with selectable backends: the original ICNN
   or a smooth convex Lipschitz ICNN.
+
+```python
+import numpy as np
+from convex_hull import ApproxConvexHull
+
+points = np.random.default_rng(0).standard_normal(size=(500, 3))
+hull = ApproxConvexHull(points, method="uniform", m=2048, backend="auto", random_state=0)
+approx_points = hull.get_vertices_points()
+
+hull_mvee = ApproxConvexHull(points, method="mvee_vmf", m=16, kappa=25.0, backend="auto")
+```
+
+`backend="auto"` chooses the C++ extension when installed, then Numba, then
+the vectorized Python backend.
 
 The DeepHull solver trains a convex function through an adversarial
 classification loss, producing a tight convex hull approximation directly from
