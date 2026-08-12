@@ -1,6 +1,5 @@
 # ConvexHull
-Fast and scalable randomized approximation algorithms for convex hulls, plus a
-deep learning baseline.
+Research code for scalable convex-hull approximation through randomized geometric methods and a convexity-aware DeepHull extension.
 
 ## Install locally
 
